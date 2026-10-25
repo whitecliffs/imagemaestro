@@ -15,6 +15,7 @@ COPY requirements*.txt constraints.txt ./
 RUN python -m pip install --upgrade pip setuptools wheel && \
     python -m pip install torch==2.9.1 torchvision==0.24.1 torchaudio==2.9.1 --index-url https://download.pytorch.org/whl/cu128
 RUN python -m pip install -c constraints.txt -r requirements-cuda.txt
+COPY LICENSE THIRD_PARTY_NOTICES.md ./
 COPY app ./app
 COPY cloud ./cloud
 COPY --from=ui /ui/dist ./ui/dist
