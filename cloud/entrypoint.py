@@ -10,14 +10,14 @@ APP = ROOT / 'app'
 DATA = Path('/workspace/imagemaestro')
 if len(os.environ.get('IMAGEMAESTRO_CLOUD_TOKEN', '')) < 32:
     raise SystemExit('Refusing cloud startup: missing strong session authentication.')
+if DATA.is_symlink():
+    raise SystemExit('Refusing to use a symlink as the persistent application directory.')
 DATA.mkdir(parents=True, exist_ok=True)
 if os.getuid() == 0:
     account = pwd.getpwnam('maestro')
-    # Do not traverse or chown other data belonging to the volume's owner.
-    for directory, dirs, files in os.walk(DATA, followlinks=False):
-        for path in [Path(directory), *(Path(directory) / name for name in dirs + files)]:
-            if not path.is_symlink():
-                os.chown(path, account.pw_uid, account.pw_gid)
+    # New application data is created after dropping privileges. Never recursively
+    # change ownership on an existing/shared network volume.
+    os.chown(DATA, account.pw_uid, account.pw_gid, follow_symlinks=False)
     os.initgroups(account.pw_name, account.pw_gid)
     os.setgid(account.pw_gid)
     os.setuid(account.pw_uid)
