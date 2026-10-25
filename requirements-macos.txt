@@ -1,0 +1,9 @@
+# Requirements for macOS (Apple Silicon: M1 / M2 / M3 / M4)
+# PyTorch with native Metal Performance Shaders (MPS) is installed first via:
+# pip install torch torchvision torchaudio
+
+-r requirements-base.txt
+
+# macOS-optimized ONNX runtime (CPU/CoreML)
+onnxruntime>=1.18.0
+rembg>=2.0.50

@@ -1,0 +1,1211 @@
+import { outputIdentity } from '../../lib/galleryIdentity'
+import { isDirectorRenderChild } from '../../lib/directorJobs'
+import { useRef, useCallback, useState, useEffect, useLayoutEffect, useMemo, type JSX } from 'react'
+import { Film, Play, Square, FolderOpen, Plus, Check, Loader2, X, BookMarked, Upload, Trash2, ChevronDown, ChevronUp, Maximize2 } from 'lucide-react'
+import { TabFilter } from './TabFilter'
+import { ThumbnailGallery } from './ThumbnailGallery'
+import { MediaFeedItem } from './MediaFeedItem'
+import { GalleryViewer, type GalleryImageChoice } from './GalleryViewer'
+import { GenerationPreview } from './GenerationPreview'
+import { GlobalQueuePopover } from '../GlobalQueuePopover'
+import { useStore } from '../../stores/useStore'
+import { useIsMobileSidecar } from '../../lib/useIsMobile'
+import { captureGallerySourceImages } from '../../lib/galleryInputs'
+import { createGalleryViewerSurface } from '../../lib/galleryFullscreen'
+import { toggleFavorite as saveFavorite } from '../../api/client'
+import { formatEstimatedClock, formatEtaDuration } from '../../lib/format'
+import { PROMPT_ENHANCEMENT_ACTIVITY } from '../../lib/promptEnhancementActivity'
+import type { GenerationJob, OutputFile } from '../../types'
+
+type ViewerSession = {
+  id: string
+  items: OutputFile[]
+  initialId: string
+  initialCompare?: boolean
+  initialTime?: number
+  sourceImages: GalleryImageChoice[]
+  workspace: string
+  allowFavorite: boolean
+  surface: ReturnType<typeof createGalleryViewerSurface>
+}
+
+function galleryNavigationScope(state: {
+  activeWorkspace: string; browsingAllFolders: boolean; browsingUploads: boolean
+  mediaFilter: string; outputSearchQuery: string
+}) {
+  return JSON.stringify([state.activeWorkspace, state.browsingAllFolders,
+    state.browsingUploads, state.mediaFilter, state.outputSearchQuery])
+}
+
+function WorkspaceSelector() {
+  const workspaces = useStore(s => s.workspaces)
+  const activeWorkspace = useStore(s => s.activeWorkspace)
+  const browsingAllFolders = useStore(s => s.browsingAllFolders)
+  const browsingUploads = useStore(s => s.browsingUploads)
+  const switchWorkspace = useStore(s => s.switchWorkspace)
+  const createWorkspace = useStore(s => s.createWorkspace)
+  const deleteWorkspace = useStore(s => s.deleteWorkspace)
+  const [open, setOpen] = useState(false)
+  const [creating, setCreating] = useState(false)
+  const [newName, setNewName] = useState('')
+  const [confirmDelete, setConfirmDelete] = useState<string | null>(null)
+  const [deleting, setDeleting] = useState<string | null>(null)
+  const [deleteError, setDeleteError] = useState<string | null>(null)
+  const dropdownRef = useRef<HTMLDivElement>(null)
+
+  const handleDelete = async (name: string, e: React.MouseEvent) => {
+    e.stopPropagation()
+    if (confirmDelete !== name) {
+      setConfirmDelete(name)
+      setTimeout(() => setConfirmDelete(c => (c === name ? null : c)), 4000)
+      return
+    }
+    setConfirmDelete(null)
+    setDeleting(name)
+    setDeleteError(null)
+    try {
+      await deleteWorkspace(name)
+    } catch (err) {
+      setDeleteError(err instanceof Error ? err.message : String(err))
+      setTimeout(() => setDeleteError(null), 6000)
+    } finally {
+      setDeleting(null)
+    }
+  }
+
+  // Close on outside click
+  useEffect(() => {
+    if (!open) return
+    const handler = (e: MouseEvent) => {
+      if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node)) {
+        setOpen(false)
+        setCreating(false)
+      }
+    }
+    document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [open])
+
+  const handleCreate = async () => {
+    const name = newName.trim().replace(/\s+/g, '-')
+    if (!name) return
+    try {
+      await createWorkspace(name)
+      setNewName('')
+      setCreating(false)
+      setOpen(false)
+    } catch {
+      // error logged in store
+    }
+  }
+
+  return (
+    <div className="relative" ref={dropdownRef}>
+      <button
+        onClick={() => setOpen(!open)}
+        className="flex items-center gap-1.5 px-2 py-1 rounded-md text-xs text-text-secondary hover:text-text-primary hover:bg-bg-hover transition-colors border border-border"
+        title="Switch workspace"
+      >
+        <FolderOpen size={12} />
+        <span className="max-w-[120px] truncate">{browsingAllFolders ? 'All folders' : browsingUploads ? 'Uploads' : activeWorkspace}</span>
+      </button>
+
+      {open && (
+        <div className="absolute right-0 top-full mt-1 w-56 bg-bg-secondary border border-border rounded-lg shadow-lg z-50 overflow-hidden">
+          <div className="px-2 py-1.5 border-b border-border">
+            <span className="text-[10px] text-text-muted uppercase tracking-wider">Workspaces</span>
+          </div>
+          <button
+            onClick={() => { switchWorkspace('__all__'); setOpen(false) }}
+            className={`w-full text-left px-3 py-2 text-xs flex items-center justify-between hover:bg-bg-hover ${browsingAllFolders ? 'text-accent-blue' : 'text-text-secondary'}`}
+            title="Browse and search every output folder. New generations keep their current destination."
+          >
+            <span className="flex items-center gap-1.5"><FolderOpen size={12} /> All folders</span>
+            {browsingAllFolders && <Check size={12} />}
+          </button>
+          <div className="max-h-[200px] overflow-y-auto">
+            {workspaces.map(ws => (
+              <div key={ws.name} className="flex items-center group hover:bg-bg-hover transition-colors">
+                <button
+                  onClick={() => { switchWorkspace(ws.name); setOpen(false) }}
+                  className={`flex-1 min-w-0 text-left px-3 py-2 text-xs flex items-center justify-between ${
+                    ws.name === activeWorkspace && !browsingUploads && !browsingAllFolders ? 'text-accent-blue' : 'text-text-secondary'
+                  }`}
+                >
+                  <span className="truncate">{ws.name}</span>
+                  {ws.name === activeWorkspace && !browsingUploads && !browsingAllFolders && <Check size={12} className="shrink-0" />}
+                </button>
+                {/* default IS the outputs folder itself — not deletable */}
+                {ws.name !== 'default' && (
+                  <button
+                    onClick={e => handleDelete(ws.name, e)}
+                    disabled={deleting === ws.name}
+                    className={`px-2 py-2 shrink-0 transition-colors ${
+                      confirmDelete === ws.name
+                        ? 'text-red-400 bg-red-500/15'
+                        : deleting === ws.name
+                          ? 'text-text-muted cursor-wait'
+                          : 'text-text-muted opacity-0 group-hover:opacity-100 focus-visible:opacity-100 hover:text-red-400'
+                    }`}
+                    title={confirmDelete === ws.name
+                      ? `Click again to permanently delete "${ws.name}" and its ${ws.file_count ?? 0} files`
+                      : `Delete workspace (${ws.file_count ?? 0} files)`}
+                  >
+                    {deleting === ws.name ? <Loader2 size={12} className="animate-spin" /> : <Trash2 size={12} />}
+                  </button>
+                )}
+              </div>
+            ))}
+          </div>
+          {deleteError && (
+            <div className="px-3 py-1.5 text-[10px] text-red-400 border-t border-border leading-snug">{deleteError}</div>
+          )}
+          {/* Virtual Uploads view — browse user-uploaded media (read-only;
+              generations keep saving to the real active workspace). */}
+          <div className="border-t border-border">
+            <button
+              onClick={() => { switchWorkspace('__uploads__'); setOpen(false) }}
+              className={`w-full text-left px-3 py-2 text-xs flex items-center justify-between hover:bg-bg-hover transition-colors ${
+                browsingUploads ? 'text-accent-blue' : 'text-text-secondary'
+              }`}
+              title="Browse media you've uploaded — reuse as inputs"
+            >
+              <span className="flex items-center gap-1.5"><Upload size={12} /> Uploads</span>
+              {browsingUploads && <Check size={12} />}
+            </button>
+          </div>
+          <div className="border-t border-border p-2">
+            {creating ? (
+              <div className="flex gap-1.5">
+                <input
+                  type="text"
+                  value={newName}
+                  onChange={e => setNewName(e.target.value)}
+                  onKeyDown={e => e.key === 'Enter' && handleCreate()}
+                  placeholder="workspace-name"
+                  className="flex-1 bg-bg-tertiary border border-border rounded px-2 py-1 text-xs text-text-primary focus:outline-none focus:border-accent-blue"
+                  autoFocus
+                />
+                <button
+                  onClick={handleCreate}
+                  disabled={!newName.trim()}
+                  className="px-2 py-1 text-xs bg-accent-blue text-white rounded hover:bg-accent-blue-hover disabled:opacity-50"
+                >
+                  Create
+                </button>
+              </div>
+            ) : (
+              <button
+                onClick={() => setCreating(true)}
+                className="w-full text-left px-1 py-1 text-xs text-accent-blue hover:text-accent-blue-hover flex items-center gap-1"
+              >
+                <Plus size={12} /> New Workspace
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// How many items to render beyond the viewport in each direction
+const OVERSCAN = 5
+// Info bar height + border/padding
+const INFO_BAR_HEIGHT = 48
+// aspect-video = 56.25% of width (16:9)
+const ASPECT_RATIO = 0.5625
+// Gap between items (tailwind space-y-3 = 12px)
+const GAP = 12
+
+function stripTimeSuffix(msg: string): string {
+  return msg.replace(/\s*\|\s*\d+:\d+.*$/, '').trim()
+}
+
+function H3PromptDisclosure({ job }: { job: GenerationJob }) {
+  const h3PlanSignature = job.h3WindowPlan?.signature
+  const [h3PromptDisclosure, setH3PromptDisclosure] = useState({
+    signature: h3PlanSignature,
+    open: false,
+  })
+  const showH3Prompts = (
+    h3PromptDisclosure.signature === h3PlanSignature && h3PromptDisclosure.open
+  )
+  const h3WindowMatch = (job.phase || job.message || '').match(/Sliding Window\s+(\d+)\/(\d+)/i)
+  const activeH3Window = job.currentWindow ?? (h3WindowMatch ? Number(h3WindowMatch[1]) : 1)
+  const activeH3PlanWindow = job.h3WindowPlan?.windows.find(
+    window => window.index === activeH3Window,
+  ) || job.h3WindowPlan?.windows[0]
+  return (
+    <>
+      {job.h3WindowPlan && activeH3PlanWindow && (
+        <div className="border-t border-border bg-bg-secondary/60 px-3 py-2">
+          <div className="flex items-center justify-between gap-2 text-[10px] text-text-muted">
+            <span className="font-medium text-text-secondary">
+              Exact H3 prompt · Window {activeH3PlanWindow.index}/{job.h3WindowPlan.window_count}
+            </span>
+            <button
+              type="button"
+              onClick={() => setH3PromptDisclosure(current => ({
+                signature: h3PlanSignature,
+                open: current.signature === h3PlanSignature ? !current.open : true,
+              }))}
+              className="flex items-center gap-1 text-accent-blue hover:text-accent-blue/80"
+            >
+              {showH3Prompts ? 'Hide all' : 'View all'}
+              {showH3Prompts ? <ChevronUp size={11} /> : <ChevronDown size={11} />}
+            </button>
+          </div>
+          <p className="mt-1 text-[10px] leading-relaxed text-text-muted line-clamp-3 whitespace-pre-wrap break-words">
+            {activeH3PlanWindow.prompt}
+          </p>
+          {showH3Prompts && (
+            <div className="mt-2 max-h-80 overflow-y-auto space-y-2 border-t border-border pt-2">
+              {job.h3WindowPlan.windows.map(window => (
+                <div
+                  key={`${window.index}-${window.start_frame}`}
+                  className={`rounded-md border p-2 ${
+                    window.index === activeH3Window
+                      ? 'border-accent-blue/70 bg-accent-blue/5'
+                      : 'border-border bg-bg-tertiary/60'
+                  }`}
+                >
+                  <div className="mb-1 flex items-center justify-between text-[9px] text-text-muted">
+                    <span>
+                      Window {window.index}: {window.title || `Beat ${window.index}`}
+                      {window.index === activeH3Window ? ' · Generating now' : ''}
+                    </span>
+                    <span>{window.start_seconds.toFixed(1)}–{window.end_seconds.toFixed(1)}s</span>
+                  </div>
+                  <pre className="whitespace-pre-wrap break-words font-sans text-[10px] leading-relaxed text-text-secondary">
+                    {window.prompt}
+                  </pre>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </>
+  )
+}
+
+export function JobPlaceholder({ job, onStop, onDismiss }: { job: GenerationJob; onStop?: () => void; onDismiss: () => void }) {
+  const hasSteps = job.totalSteps > 0
+  const progressPct = hasSteps ? (job.step / job.totalSteps) * 100 : job.progress * 100
+  const phase = stripTimeSuffix(job.phase || job.message)
+  const isFailed = job.status === 'failed' || job.status === 'cancelled'
+  const preview = isFailed ? null : job.preview ?? null
+  const [previewPausedByUser, setPreviewPausedByUser] = useState(false)
+  const [previewInfoVisible, setPreviewInfoVisible] = useState(true)
+  const isPromptPlanning = job.kind === 'prompt_enhancement'
+  const errorText = job.error || job.message || (job.status === 'cancelled' ? 'Cancelled' : 'Generation failed')
+  const h3WindowMatch = (job.phase || job.message || '').match(/Sliding Window\s+(\d+)\/(\d+)/i)
+  const activeH3Window = job.currentWindow ?? (h3WindowMatch ? Number(h3WindowMatch[1]) : 1)
+  const totalStudioWindows = job.totalWindows ?? (h3WindowMatch ? Number(h3WindowMatch[2]) : 1)
+  const isMultiWindow = totalStudioWindows > 1
+  const isMultiClip = (job.totalClips ?? 1) > 1
+  const windowEta = formatEtaDuration(job.windowEtaSeconds)
+  const windowClock = formatEstimatedClock(job.windowCompletionAt)
+  const generationEta = formatEtaDuration(job.generationEtaSeconds)
+  const generationClock = formatEstimatedClock(job.generationCompletionAt)
+
+  return (
+    <div data-generation-job-id={job.id} className={`rounded-xl border overflow-hidden ${
+      isFailed ? 'border-red-500/30 bg-bg-tertiary' : 'border-accent-blue/30 bg-bg-tertiary'
+    }`}>
+      <div className="w-full aspect-video flex items-center justify-center relative">
+        {preview && <GenerationPreview
+          preview={preview}
+          infoVisible={previewInfoVisible}
+          onToggleInfo={() => setPreviewInfoVisible(visible => !visible)}
+          initiallyPaused={previewPausedByUser}
+          onPausedChange={setPreviewPausedByUser}
+        />}
+        {/* Dismiss button (top-right, failed only) */}
+        {isFailed && (
+          <button
+            onClick={onDismiss}
+            className="absolute top-2 right-2 p-1.5 rounded-full bg-bg-active text-text-secondary hover:bg-red-600 hover:text-white transition-colors z-10"
+            title="Dismiss"
+          >
+            <X size={14} />
+          </button>
+        )}
+        <div hidden={!!preview && !previewInfoVisible} className={`flex flex-col items-center gap-3 w-full max-w-md px-4 text-text-muted ${preview
+          ? 'pointer-events-none absolute inset-x-0 bottom-0 z-10 max-w-none bg-gradient-to-t from-black/95 via-black/75 to-transparent px-3 pb-2 pt-9 text-white'
+          : ''} ${preview && !previewInfoVisible ? 'hidden' : ''}`}>
+          {!preview && <Film size={40} className={isFailed ? 'text-red-400' : 'animate-pulse'} />}
+
+          <div className="text-center w-full">
+            <p className={`text-sm font-medium ${isFailed ? 'text-red-400' : preview ? 'text-white' : 'text-text-secondary'}`}>
+              {isFailed
+                ? (job.status === 'cancelled' ? 'Cancelled' : 'Generation Failed')
+                : isPromptPlanning
+                  ? 'Planning with AI...'
+                  : job.status === 'queued'
+                    ? 'Queued...'
+                    : 'Generating...'}
+            </p>
+            {!isFailed && phase && (
+              <p className="text-xs mt-1 truncate">{phase}</p>
+            )}
+            {!isFailed && job.previewNotice && (
+              <p className={`text-[10px] mt-0.5 truncate ${preview ? 'text-white/75' : 'text-text-muted'}`}>
+                {job.previewNotice}
+              </p>
+            )}
+            {hasSteps && !isFailed && (
+              <p className="text-[10px] text-text-muted mt-0.5">
+                Step {job.step}/{job.totalSteps}
+              </p>
+            )}
+            {!isFailed && job.status === 'running' && (
+              <div className="mt-1 space-y-0.5 text-[10px] text-text-muted">
+                {isMultiClip && (
+                  <p>
+                    Clip {job.currentClip ?? 1}/{job.totalClips}
+                    {isMultiWindow ? ` · Window ${activeH3Window}/${totalStudioWindows}` : ''}
+                  </p>
+                )}
+                {isMultiWindow && windowEta && (
+                  <p>
+                    Window {activeH3Window}/{totalStudioWindows} · {windowEta} remaining
+                    {windowClock ? ` · around ${windowClock}` : ''}
+                  </p>
+                )}
+                {generationEta ? (
+                  <p>
+                    {isMultiWindow || isMultiClip ? 'Full Studio render' : 'Estimated'} {generationEta}
+                    {generationClock ? ` · around ${generationClock}` : ''}
+                  </p>
+                ) : job.etaConfidence === 'calibrating' ? (
+                  <p>Calibrating ETA…</p>
+                ) : null}
+                {(job.etaHistorySamples ?? 0) > 0 && (
+                  <p>
+                    Learned from {job.etaHistorySamples} {job.etaHistoryMatch === 'exact' ? 'matching' : 'related'} local render{job.etaHistorySamples === 1 ? '' : 's'}
+                  </p>
+                )}
+              </div>
+            )}
+            {isFailed && (
+              <p className="text-[11px] text-text-secondary mt-2 max-h-24 overflow-y-auto px-2 leading-relaxed whitespace-pre-wrap break-words">
+                {errorText}
+              </p>
+            )}
+          </div>
+
+          {/* Progress bar — hidden when failed */}
+          {!isFailed && (
+            <div className="w-full bg-bg-active rounded-full h-1.5 overflow-hidden">
+              {progressPct > 0 ? (
+                <div
+                  className="h-full bg-accent-green rounded-full transition-all duration-300"
+                  style={{ width: `${progressPct}%` }}
+                />
+              ) : (
+                <div className="h-full bg-accent-green/60 rounded-full animate-pulse w-full" />
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+
+      <H3PromptDisclosure job={job} />
+
+      {/* Bottom bar */}
+      <div className="px-3 py-2 min-h-[40px] flex items-center justify-between">
+        <div className="text-[11px] text-text-muted truncate flex-1">
+          {isFailed ? 'Click × to dismiss — the tile stays so you can see what failed' : phase || 'Preparing...'}
+        </div>
+        {!isFailed && onStop && (
+          <button
+            onClick={onStop}
+            className="flex items-center gap-1 text-xs text-red-400 hover:text-red-300 transition-colors shrink-0 ml-2"
+          >
+            <Square size={11} />
+            Stop
+          </button>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function PipelinePlaceholder({ job }: { job: GenerationJob | null }) {
+  const pipelineStatus = useStore(s => s.pipelineStatus)
+  const pipelineId = useStore(s => s.pipelineId)
+  const stopPipeline = useStore(s => s.stopPipeline)
+  const resumePipeline = useStore(s => s.resumePipeline)
+  const reattachDirectorPipeline = useStore(s => s.reattachDirectorPipeline)
+  const [resuming, setResuming] = useState(false)
+  const [previewPausedByUser, setPreviewPausedByUser] = useState(false)
+  const [previewInfoVisible, setPreviewInfoVisible] = useState(true)
+
+  if (!pipelineId || !pipelineStatus) return null
+  if (pipelineStatus.status === 'completed') return null
+
+  const phase = pipelineStatus.phase || 'planning'
+  const progress = pipelineStatus.progress
+  const message = progress?.message || phase
+  const isFailed = pipelineStatus.status === 'failed' || pipelineStatus.status === 'cancelled'
+  const errorText = pipelineStatus.error || message || 'Director pipeline stopped'
+  const preview = !isFailed && job?.preview ? {
+    ...job.preview,
+    clip: progress?.current_clip ?? Math.max(1, progress?.current ?? job.preview.clip),
+    total_clips: progress?.total_clips ?? progress?.total ?? job.preview.total_clips,
+  } : null
+
+  const hasSteps = (progress?.total_steps ?? 0) > 0
+  const progressPct = hasSteps
+    ? ((progress?.step ?? 0) / progress!.total_steps) * 100
+    : progress && progress.total > 0
+      ? (progress.current / progress.total) * 100
+      : 0
+  const phaseLabel = stripTimeSuffix(message)
+  const currentClip = progress?.current_clip
+  const totalClips = progress?.total_clips
+  const clipEta = formatEtaDuration(progress?.clip_eta_seconds)
+  const clipClock = formatEstimatedClock(progress?.clip_completion_at)
+  const projectEta = formatEtaDuration(progress?.project_eta_seconds)
+  const projectClock = formatEstimatedClock(progress?.project_completion_at)
+
+  return (
+    <div data-director-pipeline-id={pipelineId} className={`rounded-xl overflow-hidden border ${isFailed ? 'border-red-500/30' : 'border-accent-blue/30'} bg-bg-tertiary`}>
+      <div className="w-full aspect-video flex items-center justify-center relative">
+        {preview && <GenerationPreview
+          preview={preview}
+          infoVisible={previewInfoVisible}
+          onToggleInfo={() => setPreviewInfoVisible(visible => !visible)}
+          initiallyPaused={previewPausedByUser}
+          onPausedChange={setPreviewPausedByUser}
+        />}
+        {isFailed && (
+          <button
+            type="button"
+            onClick={() => useStore.setState({ pipelineId: null, pipelineStatus: null, directorError: null })}
+            className="absolute top-2 right-2 p-1.5 rounded-full bg-bg-active text-text-secondary hover:bg-red-600 hover:text-white transition-colors z-10"
+            title="Dismiss"
+          >
+            <X size={14} />
+          </button>
+        )}
+        <div hidden={!!preview && !previewInfoVisible} className={
+          'flex flex-col items-center gap-3 text-text-muted w-full max-w-md px-4 '
+          + (preview ? 'pointer-events-none absolute inset-x-0 bottom-0 z-10 max-w-none bg-gradient-to-t from-black/95 via-black/75 to-transparent px-3 pb-2 pt-9 text-white' : '')
+          + (preview && !previewInfoVisible ? ' hidden' : '')
+        }>
+          {!preview && <Film size={40} className={isFailed ? 'text-red-400' : 'animate-pulse'} />}
+
+          <div className="text-center w-full">
+            <p className={`text-sm font-medium ${isFailed ? 'text-red-400' : preview ? 'text-white' : 'text-text-secondary'}`}>
+              {isFailed
+                ? (pipelineStatus.status === 'cancelled' ? 'Director Cancelled' : 'Director Failed')
+                : pipelineStatus.status === 'paused' ? 'Paused — Review' : 'Director'}
+            </p>
+            {!isFailed && <p className="text-xs mt-1 truncate">{phaseLabel}</p>}
+            {hasSteps && !isFailed && (
+              <p className="text-[10px] text-text-muted mt-0.5">
+                Step {progress!.step}/{progress!.total_steps}
+              </p>
+            )}
+            {!isFailed && currentClip ? (
+              <div className="mt-1 space-y-0.5 text-[10px] text-text-muted">
+                <p>
+                  Clip {currentClip}/{totalClips || '?'}
+                  {clipEta
+                    ? ` · ${clipEta} remaining${clipClock ? ` · around ${clipClock}` : ''}`
+                    : ' · Calibrating ETA…'}
+                </p>
+                {projectEta && (
+                  <p>
+                    Full Director render {projectEta}
+                    {projectClock ? ` · around ${projectClock}` : ''}
+                  </p>
+                )}
+                {(progress?.eta_history_samples ?? 0) > 0 && (
+                  <p>
+                    Learned from {progress!.eta_history_samples} {progress!.eta_history_match === 'exact' ? 'matching' : 'related'} local render{progress!.eta_history_samples === 1 ? '' : 's'}
+                  </p>
+                )}
+              </div>
+            ) : null}
+            {isFailed && (
+              <>
+                {progress && progress.total > 0 && (
+                  <p className="mt-1 text-[10px] text-text-muted">
+                    Saved progress: {progress.current}/{progress.total}
+                  </p>
+                )}
+                <p className="text-[11px] text-text-secondary mt-2 max-h-24 overflow-y-auto px-2 leading-relaxed whitespace-pre-wrap break-words">
+                  {errorText}
+                </p>
+              </>
+            )}
+          </div>
+
+          {/* Progress bar */}
+          {!isFailed && (
+            <div className="w-full bg-bg-active rounded-full h-1.5 overflow-hidden">
+              {progressPct > 0 ? (
+                <div
+                  className="h-full bg-accent-green rounded-full transition-all duration-300"
+                  style={{ width: `${progressPct}%` }}
+                />
+              ) : (
+                <div className="h-full bg-accent-green/60 rounded-full animate-pulse w-full" />
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {job && <H3PromptDisclosure job={job} />}
+
+      {/* Bottom bar with stop button */}
+      <div className="px-3 py-2 min-h-[40px] flex items-center justify-between">
+        <div className="text-[11px] text-text-muted truncate flex-1">
+          {isFailed ? 'The saved Director checkpoint can be resumed' : phaseLabel || 'Preparing...'}
+        </div>
+        {isFailed ? (
+          <div className="flex items-center gap-2 shrink-0 ml-2">
+            <button
+              type="button"
+              onClick={() => void reattachDirectorPipeline(pipelineId, true)}
+              className="text-xs text-text-secondary hover:text-text-primary transition-colors"
+            >
+              Open Director
+            </button>
+            <button
+              type="button"
+              disabled={resuming}
+              onClick={async () => {
+                setResuming(true)
+                try {
+                  await resumePipeline(pipelineId)
+                } finally {
+                  setResuming(false)
+                }
+              }}
+              className="flex items-center gap-1 rounded-md bg-accent-blue px-2 py-1 text-xs text-white hover:bg-accent-blue-hover disabled:opacity-50"
+            >
+              {resuming ? <Loader2 size={11} className="animate-spin" /> : <Play size={11} />}
+              Resume
+            </button>
+          </div>
+        ) : (
+          <button
+            onClick={() => stopPipeline()}
+            className="flex items-center gap-1 text-xs text-red-400 hover:text-red-300 transition-colors shrink-0 ml-2"
+          >
+            <Square size={11} />
+            Stop
+          </button>
+        )}
+      </div>
+    </div>
+  )
+}
+
+export function MainContent() {
+  const isMobile = useIsMobileSidecar()
+  const outputs = useStore(s => s.filteredOutputs())
+  const outputsTotal = useStore(s => s.outputsTotal)
+  const rootOutputsLoaded = useStore(s => s.outputs.length)
+  const hasMoreOutputs = useStore(s => s.outputs.length < s.outputsTotal)
+  const outputsLoading = useStore(s => s.outputsLoading)
+  const galleryInitializing = useStore(s => s.galleryInitializing)
+  const galleryLoading = outputsLoading || galleryInitializing
+  const jobs = useStore(s => s.jobs)
+  const pipelineId = useStore(s => s.pipelineId)
+  const pipelineStatus = useStore(s => s.pipelineStatus)
+  const directorChildren = useMemo(
+    () => jobs.filter(job => isDirectorRenderChild(job, pipelineId, pipelineStatus)),
+    [jobs, pipelineId, pipelineStatus],
+  )
+  const directorJob = directorChildren.find(job => job.status === 'running') ?? directorChildren[0] ?? null
+  const isEnhancing = useStore(s => s.isEnhancing)
+  const generationMode = useStore(s => s.generationMode)
+  const stopGeneration = useStore(s => s.stopGeneration)
+  const dismissJob = useStore(s => s.dismissJob)
+  const activeIndex = useStore(s => s.selectedOutput)
+  const galleryScope = useStore(galleryNavigationScope)
+  const setSelectedOutput = useStore(s => s.setSelectedOutput)
+  const [viewerSession, setViewerSession] = useState<ViewerSession | null>(null)
+  const releaseViewerImages = useRef<(() => void) | null>(null)
+  useEffect(() => () => { releaseViewerImages.current?.() }, [])
+
+  const openViewer = useCallback((file: OutputFile, options?: {compare?: boolean; currentTime?: number}) => {
+    if (file.type === 'audio') return
+    const state = useStore.getState()
+    releaseViewerImages.current?.()
+    const sources = captureGallerySourceImages()
+    const surface = createGalleryViewerSurface(!options?.compare)
+    releaseViewerImages.current = () => { sources.release(); surface.release() }
+    setViewerSession({
+      id: `${Date.now()}:${outputIdentity(file)}`,
+      items: state.filteredOutputs().filter(item => item.type !== 'audio'),
+      initialId: outputIdentity(file), initialCompare: options?.compare, initialTime: options?.currentTime,
+      sourceImages: sources.images, workspace: state.activeWorkspace, allowFavorite: !state.browsingUploads, surface,
+    })
+  }, [])
+
+  const favoriteInViewer = useCallback(async (file: OutputFile) => {
+    if (!viewerSession?.allowFavorite) return
+    const origin = file.workspace || viewerSession.workspace
+    const result = await saveFavorite(file.name, origin)
+    useStore.getState().setGalleryOutputFavorite(file.name, origin, result.favorite)
+    // Keep this viewing session stable even when removing an item from Favorites.
+    setViewerSession(current => current && current.id === viewerSession.id ? {...current,
+      items: current.items.map(item => outputIdentity(item) === outputIdentity(file)
+        ? {...item, favorite: result.favorite} : item),
+    } : current)
+  }, [viewerSession])
+
+  const loadMoreForViewer = useCallback(async () => {
+    if (!viewerSession) return
+    await useStore.getState().loadMoreOutputs()
+    const next = useStore.getState().filteredOutputs().filter(item => item.type !== 'audio')
+    setViewerSession(current => {
+      if (!current || current.id !== viewerSession.id) return current
+      const known = new Set(current.items.map(outputIdentity))
+      return {...current, items: [...current.items, ...next.filter(item => !known.has(outputIdentity(item)))]}
+    })
+  }, [viewerSession])
+  // Waiting work now lives in the universal top-bar queue. Keep the gallery
+  // focused on media plus useful live/error cards instead of large blank
+  // placeholders for every job that has not started yet.
+  const galleryJobs = useMemo(
+    () => {
+      const visibleJobs = jobs.filter(job => (
+        !directorChildren.includes(job)
+        && job.status !== 'held'
+        && job.status !== 'completed'
+        && (job.status !== 'queued' || job.showInGallery === true)
+      ))
+      return isEnhancing ? [PROMPT_ENHANCEMENT_ACTIVITY, ...visibleJobs] : visibleJobs
+    },
+    [isEnhancing, jobs, directorChildren],
+  )
+
+  const feedRef = useRef<HTMLDivElement>(null)
+  const placeholdersRef = useRef<HTMLDivElement>(null)
+  const [navigationTarget, setNavigationTarget] = useState<{ id: string; scope: string } | null>(null)
+  const scrollTargetId = useRef<string | null>(null)
+  const centerSelectionFrame = useRef<number | null>(null)
+  const navigationReleaseFrame = useRef<number | null>(null)
+  const previousGalleryScope = useRef(galleryScope)
+
+  useLayoutEffect(() => {
+    if (previousGalleryScope.current === galleryScope) return
+    previousGalleryScope.current = galleryScope
+    // Folder/filter/search changes select the start of a new result list.
+    // An old scroll position must not immediately replace that selection.
+    feedRef.current?.scrollTo({ top: 0, behavior: 'auto' })
+  }, [galleryScope])
+
+  const releaseNavigationTarget = useCallback(() => {
+    if (navigationReleaseFrame.current !== null) {
+      cancelAnimationFrame(navigationReleaseFrame.current)
+      navigationReleaseFrame.current = null
+    }
+    scrollTargetId.current = null
+    setNavigationTarget(null)
+  }, [])
+
+  const activateIndex = useCallback((index: number) => {
+    const file = useStore.getState().filteredOutputs()[index]
+    if (!file) return
+    if (scrollTargetId.current !== null && scrollTargetId.current !== outputIdentity(file)) {
+      releaseNavigationTarget()
+    }
+    // Avoid re-fetching the same output metadata on every scroll event.
+    if (useStore.getState().selectedOutput !== index) {
+      setSelectedOutput(index)
+    }
+  }, [setSelectedOutput, releaseNavigationTarget])
+
+  const selectViewportCenteredItem = useCallback(() => {
+    centerSelectionFrame.current = null
+    if (scrollTargetId.current !== null) return
+
+    const feedEl = feedRef.current
+    if (!feedEl) return
+    const viewport = feedEl.getBoundingClientRect()
+    const viewportCenterY = viewport.top + viewport.height / 2
+
+    // Playback is a stronger intent signal than passive scrolling. Keep a
+    // currently playing, still-visible clip selected so a pending scroll frame
+    // cannot immediately mute/pause the item the user just started.
+    const playingMedia = Array.from(
+      feedEl.querySelectorAll<HTMLMediaElement>('[data-gallery-media="true"]'),
+    ).find(media => !media.paused && !media.ended)
+    const playingItem = playingMedia?.closest<HTMLElement>('[data-feed-index]')
+    if (playingItem) {
+      const rect = playingItem.getBoundingClientRect()
+      if (Math.min(rect.bottom, viewport.bottom) > Math.max(rect.top, viewport.top)) {
+        const index = Number(playingItem.dataset.feedIndex)
+        if (Number.isInteger(index)) {
+          activateIndex(index)
+          return
+        }
+      }
+    }
+
+    // The viewport center sits below the first card when the gallery is at its
+    // hard top (especially on phones with a tall viewport), so center-based
+    // selection alone can incorrectly highlight card two. At either scroll
+    // boundary, prefer the first/last actually visible output. Direct playback
+    // remains stronger intent and is handled above.
+    const visibleItems = Array.from(
+      feedEl.querySelectorAll<HTMLElement>('[data-feed-index]'),
+    ).filter((item) => {
+      const rect = item.getBoundingClientRect()
+      return Math.min(rect.bottom, viewport.bottom) > Math.max(rect.top, viewport.top)
+    })
+    const boundaryTolerance = 3
+    if (feedEl.scrollTop <= boundaryTolerance && visibleItems.length > 0) {
+      const firstIndex = Math.min(...visibleItems.map(item => Number(item.dataset.feedIndex)))
+      if (Number.isInteger(firstIndex)) {
+        activateIndex(firstIndex)
+        return
+      }
+    }
+    if (
+      feedEl.scrollHeight - feedEl.scrollTop - feedEl.clientHeight <= boundaryTolerance
+      && visibleItems.length > 0
+    ) {
+      const lastIndex = Math.max(...visibleItems.map(item => Number(item.dataset.feedIndex)))
+      if (Number.isInteger(lastIndex)) {
+        activateIndex(lastIndex)
+        return
+      }
+    }
+
+    let bestIndex: number | null = null
+    let bestEdgeDistance = Number.POSITIVE_INFINITY
+    let bestCenterDistance = Number.POSITIVE_INFINITY
+
+    feedEl.querySelectorAll<HTMLElement>('[data-feed-index]').forEach((item) => {
+      const index = Number(item.dataset.feedIndex)
+      if (!Number.isInteger(index)) return
+      const rect = item.getBoundingClientRect()
+      const visibleTop = Math.max(rect.top, viewport.top)
+      const visibleBottom = Math.min(rect.bottom, viewport.bottom)
+      if (visibleBottom <= visibleTop) return
+
+      // Prefer the card intersected by the viewport's horizontal center line.
+      // The item-center distance breaks ties for unusually tall/overlapping
+      // layouts and keeps the behavior intuitive during responsive resizing.
+      const edgeDistance = viewportCenterY < rect.top
+        ? rect.top - viewportCenterY
+        : viewportCenterY > rect.bottom
+          ? viewportCenterY - rect.bottom
+          : 0
+      const centerDistance = Math.abs((rect.top + rect.bottom) / 2 - viewportCenterY)
+      if (
+        edgeDistance < bestEdgeDistance
+        || (edgeDistance === bestEdgeDistance && centerDistance < bestCenterDistance)
+      ) {
+        bestIndex = index
+        bestEdgeDistance = edgeDistance
+        bestCenterDistance = centerDistance
+      }
+    })
+
+    if (bestIndex !== null) activateIndex(bestIndex)
+  }, [activateIndex])
+
+  const scheduleCenteredSelection = useCallback(() => {
+    if (centerSelectionFrame.current !== null) return
+    centerSelectionFrame.current = requestAnimationFrame(selectViewportCenteredItem)
+  }, [selectViewportCenteredItem])
+
+  useEffect(() => () => {
+    if (centerSelectionFrame.current !== null) {
+      cancelAnimationFrame(centerSelectionFrame.current)
+      centerSelectionFrame.current = null
+    }
+    if (navigationReleaseFrame.current !== null) {
+      cancelAnimationFrame(navigationReleaseFrame.current)
+      navigationReleaseFrame.current = null
+    }
+  }, [])
+
+  // Virtualization state
+  const [scrollTop, setScrollTop] = useState(0)
+  const [containerHeight, setContainerHeight] = useState(800)
+  const [containerWidth, setContainerWidth] = useState(800)
+  const [measuredHeights, setMeasuredHeights] = useState<Map<string, { height: number; width: number }>>(() => new Map())
+  const [placeholderTotalHeight, setPlaceholderTotalHeight] = useState(0)
+  const outputIds = useMemo(() => outputs.map(outputIdentity), [outputs])
+  const retainedOutputIds = useMemo(() => new Set(outputIds), [outputIds])
+  const previousOutputIds = useRef(retainedOutputIds)
+  const navigationIndex = navigationTarget?.scope === galleryScope ? outputIds.indexOf(navigationTarget.id) : -1
+
+  useLayoutEffect(() => {
+    if (previousOutputIds.current.size > 0 && outputIds.length > 0
+      && !outputIds.some(id => previousOutputIds.current.has(id))) {
+      feedRef.current?.scrollTo({ top: 0, behavior: 'auto' })
+    }
+    previousOutputIds.current = retainedOutputIds
+  }, [outputIds, retainedOutputIds])
+
+  // Dynamic estimated item height based on actual container width
+  const estimatedItemHeight = Math.round(containerWidth * ASPECT_RATIO) + INFO_BAR_HEIGHT
+
+  // Pipeline and job cards have different heights, including expanded/error
+  // states. Their actual flow height is the origin of the virtual output list.
+  useEffect(() => {
+    const el = placeholdersRef.current
+    if (!el) return
+    const ro = new ResizeObserver(() => {
+      setPlaceholderTotalHeight(el.getBoundingClientRect().height + GAP)
+      scheduleCenteredSelection()
+    })
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [scheduleCenteredSelection])
+
+  // Measurements include their width so a resize cannot reuse stale heights.
+  useEffect(() => {
+    const el = feedRef.current
+    if (!el) return
+    const ro = new ResizeObserver((entries) => {
+      const rect = entries[0].contentRect
+      setContainerHeight(rect.height)
+      setContainerWidth(rect.width)
+      scheduleCenteredSelection()
+    })
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [scheduleCenteredSelection])
+
+  const getItemHeight = useCallback((index: number) => {
+    const measurement = measuredHeights.get(outputIds[index])
+    return measurement && Math.abs(measurement.width - containerWidth) <= 1
+      ? measurement.height
+      : estimatedItemHeight
+  }, [outputIds, measuredHeights, containerWidth, estimatedItemHeight])
+
+  const { startIndex, endIndex, totalHeight, itemOffsets } = useMemo(() => {
+    const count = outputs.length
+    const offsets: number[] = new Array(count)
+    let cumulative = placeholderTotalHeight
+
+    for (let i = 0; i < count; i++) {
+      offsets[i] = cumulative
+      cumulative += getItemHeight(i) + GAP
+    }
+    const total = cumulative - (count > 0 ? GAP : 0)
+
+    let lo = 0, hi = count - 1
+    const viewStart = scrollTop - OVERSCAN * estimatedItemHeight
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1
+      if (offsets[mid] + getItemHeight(mid) < viewStart) lo = mid + 1
+      else hi = mid
+    }
+    const start = Math.max(0, lo)
+
+    const viewEnd = scrollTop + containerHeight + OVERSCAN * estimatedItemHeight
+    let end = start
+    while (end < count && offsets[end] < viewEnd) end++
+
+    return {
+      startIndex: start,
+      endIndex: Math.min(end, count),
+      totalHeight: Math.max(total, placeholderTotalHeight),
+      itemOffsets: offsets,
+    }
+  }, [outputs.length, scrollTop, containerHeight, getItemHeight, placeholderTotalHeight, estimatedItemHeight])
+
+  const handleItemMeasured = useCallback((index: number, height: number) => {
+    const id = outputIds[index]
+    // ResizeObserver can deliver a zero-size record as a virtual row leaves
+    // the DOM. Caching it collapses that row and makes navigation oscillate.
+    if (!id || !Number.isFinite(height) || height <= 0) return
+    setMeasuredHeights(current => {
+      const previous = current.get(id)
+      if (previous?.height === height && previous.width === containerWidth) return current
+      const next = new Map(current)
+      for (const key of next.keys()) {
+        if (!retainedOutputIds.has(key)) next.delete(key)
+      }
+      next.set(id, { height, width: containerWidth })
+      return next
+    })
+    scheduleCenteredSelection()
+  }, [outputIds, retainedOutputIds, containerWidth, scheduleCenteredSelection])
+
+  const handlePlaybackStart = useCallback((index: number, media: HTMLMediaElement) => {
+    activateIndex(index)
+    // One audible gallery player at a time. This avoids the only meaningful
+    // downside of auto-unmuting: two clips talking over one another.
+    feedRef.current?.querySelectorAll<HTMLMediaElement>('[data-gallery-media="true"]').forEach((candidate) => {
+      if (candidate === media) return
+      candidate.pause()
+      candidate.muted = true
+    })
+    media.muted = false
+  }, [activateIndex])
+
+  const handleThumbnailClick = useCallback((id: string) => {
+    const state = useStore.getState()
+    // A generation can insert a new row between pointer-down and click.
+    // Resolve the rendered thumbnail's identity against the latest list.
+    const index = state.filteredOutputs().findIndex(file => outputIdentity(file) === id)
+    if (index < 0) return
+    // Hold the user's selection while virtual rows and delayed metadata settle.
+    // A fresh object also realigns a second click on the same thumbnail.
+    scrollTargetId.current = id
+    setNavigationTarget({ id, scope: galleryNavigationScope(state) })
+    setSelectedOutput(index)
+  }, [setSelectedOutput])
+
+  useLayoutEffect(() => {
+    if (!navigationTarget || scrollTargetId.current !== navigationTarget.id) return
+    if (navigationIndex < 0) {
+      scrollTargetId.current = null
+      navigationReleaseFrame.current = requestAnimationFrame(() => {
+        navigationReleaseFrame.current = null
+        // Removing/filtering the target must not cancel a newer click.
+        if (scrollTargetId.current === null) releaseNavigationTarget()
+      })
+      scheduleCenteredSelection()
+      return
+    }
+    const feedEl = feedRef.current
+    const targetEl = feedEl?.querySelector<HTMLElement>(`[data-feed-index="${navigationIndex}"]`)
+    if (!feedEl || !targetEl) return
+
+    const viewport = feedEl.getBoundingClientRect()
+    const target = targetEl.getBoundingClientRect()
+    const padding = parseFloat(getComputedStyle(feedEl).paddingTop) || 0
+    const delta = target.height >= feedEl.clientHeight - padding * 2
+      ? target.top - viewport.top - padding
+      : (target.top + target.bottom - viewport.top - viewport.bottom) / 2
+    const top = Math.max(0, Math.min(
+      feedEl.scrollTop + delta,
+      feedEl.scrollHeight - feedEl.clientHeight,
+    ))
+    if (Math.abs(feedEl.scrollTop - top) > 1) {
+      // Scroll only this feed. scrollIntoView can also move the page/sidecar.
+      feedEl.scrollTo({ top, behavior: 'auto' })
+    }
+    const state = useStore.getState()
+    if (state.selectedOutput !== navigationIndex) state.setSelectedOutput(navigationIndex)
+  }, [navigationTarget, navigationIndex, itemOffsets, containerHeight, containerWidth,
+    placeholderTotalHeight, releaseNavigationTarget, scheduleCenteredSelection])
+
+  const closeViewer = useCallback((id: string) => {
+    setViewerSession(null)
+    releaseViewerImages.current?.()
+    releaseViewerImages.current = null
+    handleThumbnailClick(id)
+  }, [handleThumbnailClick])
+
+  // Infinite scroll: load more when near the bottom
+  const loadingMore = useRef(false)
+  const handleFeedScroll = useCallback(() => {
+    const el = feedRef.current
+    if (!el) return
+    setScrollTop(el.scrollTop)
+    scheduleCenteredSelection()
+    // Trigger load-more when within 2 screens of the bottom
+    const distanceToBottom = el.scrollHeight - el.scrollTop - el.clientHeight
+    if (distanceToBottom < el.clientHeight * 2 && !loadingMore.current) {
+      const store = useStore.getState()
+      if (store.outputs.length < store.outputsTotal) {
+        loadingMore.current = true
+        store.loadMoreOutputs().finally(() => { loadingMore.current = false })
+      }
+    }
+  }, [scheduleCenteredSelection])
+
+  useEffect(() => {
+    // Appending a page or inserting a new generation must not erase heights
+    // of still-mounted cards: ResizeObserver may never report them again.
+    scheduleCenteredSelection()
+  }, [outputIds, scheduleCenteredSelection])
+
+  const visibleItems = useMemo(() => {
+    const items: JSX.Element[] = []
+    const indices = Array.from({ length: endIndex - startIndex }, (_, i) => startIndex + i)
+    // Mount a distant target immediately, without rendering all intervening
+    // cards. Its real height can then correct the estimated virtual offset.
+    if (navigationIndex >= 0 && (navigationIndex < startIndex || navigationIndex >= endIndex)) {
+      indices.push(navigationIndex)
+      indices.sort((a, b) => a - b)
+    }
+    for (const i of indices) {
+      const file = outputs[i]
+      if (!file) continue
+      items.push(
+        <MediaFeedItem
+          key={outputIdentity(file)}
+          file={file}
+          index={i}
+          isActive={activeIndex === i}
+          onActivate={activateIndex}
+          onPlaybackStart={handlePlaybackStart}
+          onMeasured={handleItemMeasured}
+          onOpenViewer={openViewer}
+          style={{
+            position: 'absolute',
+            top: itemOffsets[i],
+            left: 0,
+            right: 0,
+          }}
+        />
+      )
+    }
+    return items
+  }, [startIndex, endIndex, navigationIndex, outputs, activeIndex, activateIndex, handlePlaybackStart, handleItemMeasured, itemOffsets, openViewer])
+
+  return (
+    <main className="flex-1 flex flex-col min-h-0 min-w-0 h-full overflow-hidden">
+      {/* Top bar */}
+      <div className="px-2 md:px-6 py-2 md:py-3 border-b border-border flex items-center justify-between gap-2">
+        <TabFilter />
+        <div className="flex items-center gap-2 shrink-0">
+          <div className="hidden text-xs text-text-muted xl:block">
+            {outputsTotal > rootOutputsLoaded
+              ? `${rootOutputsLoaded} / ${outputsTotal} outputs`
+              : `${outputsTotal} ${outputsTotal === 1 ? 'output' : 'outputs'}`}
+            {outputs.length > rootOutputsLoaded && ` · ${outputs.length - rootOutputsLoaded} expanded`}
+          </div>
+          <button type="button" aria-label="Open full-screen gallery" title="Open full-screen gallery"
+            disabled={!outputs.some(file => file.type !== 'audio')}
+            onClick={() => {
+              const selected = outputs[activeIndex]
+              const file = selected && selected.type !== 'audio' ? selected : outputs.find(item => item.type !== 'audio')
+              if (file) openViewer(file)
+            }}
+            className="rounded-lg p-1.5 text-text-secondary hover:bg-bg-hover hover:text-text-primary disabled:opacity-35">
+            <Maximize2 size={16} />
+          </button>
+          <WorkspaceSelector />
+          {!isMobile && <GlobalQueuePopover />}
+        </div>
+      </div>
+
+      {/* Content area: feed + thumbnails */}
+      <div className="flex-1 flex flex-row gap-0 overflow-hidden relative">
+        {/* Scrollable media feed */}
+        <div
+          ref={feedRef}
+          className="flex-1 overflow-y-auto p-3 md:p-4"
+          style={{ overflowAnchor: 'none' }}
+          onScroll={handleFeedScroll}
+          onWheelCapture={releaseNavigationTarget}
+          onTouchMove={releaseNavigationTarget}
+          onPointerDown={event => {
+            // Native scrollbar/empty-feed drags surrender navigation, while
+            // opening details on the selected card keeps its layout anchored.
+            if (event.target === event.currentTarget) releaseNavigationTarget()
+          }}
+          onKeyDown={event => {
+            if (!['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '].includes(event.key)) return
+            if ((event.target as HTMLElement).closest('input, textarea, select, button, video, audio, [contenteditable="true"]')) return
+            releaseNavigationTarget()
+          }}
+        >
+          {/* Pipeline + Job placeholders at top (not virtualized — small count) */}
+          <div ref={placeholdersRef} className="space-y-3 mb-3">
+            <PipelinePlaceholder key={pipelineId} job={directorJob} />
+            {galleryJobs.map((j, i) => (
+              <JobPlaceholder
+                key={j.id || `pending-${i}`}
+                job={j}
+                onStop={j.kind === 'prompt_enhancement' ? undefined : () => stopGeneration(j.id)}
+                onDismiss={() => dismissJob(j.id)}
+              />
+            ))}
+          </div>
+
+          {/* Position container for virtualized output items */}
+          <div className="relative" style={{ height: totalHeight - placeholderTotalHeight }}>
+            {visibleItems.map(item => {
+              // Adjust top positions to be relative to this container (subtract placeholder height)
+              const adjustedStyle = {
+                ...item.props.style,
+                top: (item.props.style?.top as number) - placeholderTotalHeight,
+              }
+              return { ...item, props: { ...item.props, style: adjustedStyle } }
+            })}
+          </div>
+
+          {/* Loading state */}
+          {galleryLoading && outputs.length === 0 && (
+            <div role="status" className="flex items-center justify-center min-h-[300px]">
+              <div className="flex flex-col items-center gap-3 text-text-muted">
+                <Loader2 size={24} className="animate-spin text-accent-blue" />
+                <p className="text-sm">{galleryInitializing ? 'Loading workspace...' : 'Indexing workspace...'}</p>
+              </div>
+            </div>
+          )}
+
+          {/* Empty state — first-run quick start. Teaches the three steps
+              to a first generation and sets the one expectation that most
+              surprises new users: the first run of each model downloads
+              its weights (tens of GB) before anything appears. */}
+          {!galleryLoading && outputs.length === 0 && jobs.length === 0 && (() => {
+            const noun = generationMode === 'image' ? 'images'
+              : generationMode === 'audio' ? 'audio' : 'videos'
+            const example = generationMode === 'image'
+              ? 'a neon city street at night, cinematic'
+              : generationMode === 'audio'
+              ? 'a dreamy synthwave track about the ocean'
+              : 'a golden retriever surfing a big wave, slow motion'
+            return (
+              <div className="flex items-center justify-center min-h-[300px] px-6">
+                <div className="flex flex-col items-center gap-4 text-center max-w-sm">
+                  <div className="w-16 h-16 rounded-2xl bg-bg-active flex items-center justify-center text-text-muted">
+                    <Play size={24} />
+                  </div>
+                  <p className="text-sm text-text-secondary">Your generated {noun} will appear here.</p>
+                  <ol className="text-xs text-text-muted space-y-1.5 text-left">
+                    <li><span className="text-accent-blue font-medium">1.</span> Pick a model in the sidebar (a good default is already selected).</li>
+                    <li><span className="text-accent-blue font-medium">2.</span> Type a prompt — e.g. <span className="text-text-secondary italic">“{example}”</span></li>
+                    <li><span className="text-accent-blue font-medium">3.</span> Hit Generate.</li>
+                  </ol>
+                  <p className="text-[11px] text-text-muted leading-snug">
+                    Heads up: the first time you use a model, its weights download
+                    once (often tens of GB) before generation starts — later runs
+                    are fast. Progress shows at the bottom-right.
+                  </p>
+                  <button
+                    onClick={() => useStore.getState().setRecipesOpen(true)}
+                    className="mt-1 flex items-center gap-1.5 px-3 py-1.5 text-xs bg-accent-blue/10 border border-accent-blue/30 rounded-lg text-accent-blue hover:bg-accent-blue/20 transition-colors"
+                  >
+                    <BookMarked size={13} /> Browse recipes
+                  </button>
+                </div>
+              </div>
+            )
+          })()}
+        </div>
+
+        {/* Thumbnail sidebar */}
+        <ThumbnailGallery
+          activeIndex={activeIndex}
+          onThumbnailClick={handleThumbnailClick}
+        />
+      </div>
+      {viewerSession && (
+        <GalleryViewer key={viewerSession.id}
+          surface={viewerSession.surface}
+          items={viewerSession.items} initialId={viewerSession.initialId}
+          initialCompare={viewerSession.initialCompare} initialTime={viewerSession.initialTime}
+          sourceImages={viewerSession.sourceImages}
+          comparisonImages={viewerSession.items.filter(file => file.type === 'image').map(file => ({
+            id: outputIdentity(file), url: file.url, name: file.workspace ? `${file.workspace} / ${file.name}` : file.name,
+          }))}
+          allowFavorite={viewerSession.allowFavorite} onFavorite={favoriteInViewer} onClose={closeViewer}
+          hasMore={hasMoreOutputs} onLoadMore={loadMoreForViewer} />
+      )}
+    </main>
+  )
+}

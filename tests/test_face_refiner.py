@@ -1,0 +1,499 @@
+"""Face identity, timeline, source-protection and recipe regressions."""
+import contextlib
+import json
+from pathlib import Path
+import sys
+import tempfile
+from types import SimpleNamespace
+import unittest
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
+import numpy as np
+import torch
+from services import face_refiner as service
+from services.media_flow import ProcessingCancelled
+from postprocessing.h3_face_refiner import runtime, face
+
+
+class FaceRefinerContracts(unittest.TestCase):
+    @staticmethod
+    def _winerror_145():
+        error = OSError(145, "The directory is not empty")
+        error.winerror = 145
+        return error
+
+    def test_temp_cleanup_retries_windows_directory_not_empty(self):
+        class LockedTemporaryDirectory:
+            def __init__(self, path):
+                self.name = str(path)
+
+            def cleanup(self):
+                raise FaceRefinerContracts._winerror_145()
+
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "frames"
+            path.mkdir()
+            temporary = LockedTemporaryDirectory(path)
+            remove = service._remove_temporary_tree
+            attempts = []
+
+            def locked_once(candidate):
+                attempts.append(candidate)
+                if len(attempts) == 1:
+                    raise FaceRefinerContracts._winerror_145()
+                remove(candidate)
+
+            with patch.object(service, "_remove_temporary_tree", side_effect=locked_once), \
+                 patch.object(service.time, "sleep"), \
+                 patch.object(service, "_schedule_deferred_temporary_cleanup") as defer:
+                service._cleanup_temporary_directory(temporary)
+
+            self.assertFalse(path.exists())
+            self.assertEqual(len(attempts), 2)
+            defer.assert_not_called()
+
+    def test_cleanup_lock_does_not_replace_processing_exception(self):
+        class LockedTemporaryDirectory:
+            def __init__(self, path):
+                self.name = str(path)
+
+            def cleanup(self):
+                raise FaceRefinerContracts._winerror_145()
+
+        cleanup = tempfile.TemporaryDirectory()
+        try:
+            root = Path(cleanup.name)
+            path = root / "frames"
+            path.mkdir()
+            temporary = LockedTemporaryDirectory(path)
+            with patch.object(service, "_root", return_value=root), \
+                 patch.object(service.tempfile, "TemporaryDirectory", return_value=temporary), \
+                 patch.object(service, "_remove_temporary_tree", side_effect=self._winerror_145()), \
+                 patch.object(service, "_schedule_deferred_temporary_cleanup",
+                              side_effect=RuntimeError("cleanup worker unavailable")) as defer, \
+                 patch.object(service.time, "sleep"):
+                with self.assertLogs(service.__name__, level="WARNING") as logs:
+                    with self.assertRaisesRegex(RuntimeError, "tracking failed"):
+                        with service._temporary_directory("frames-"):
+                            raise RuntimeError("tracking failed")
+
+            self.assertTrue(any("cleanup is deferred" in record for record in logs.output))
+            self.assertTrue(any("could not schedule deferred cleanup" in record for record in logs.output))
+            defer.assert_called_once_with(path)
+        finally:
+            cleanup.cleanup()
+
+    def test_completed_output_survives_persistent_temporary_lock(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            locked_path = root / "frames"
+            locked_path.mkdir()
+            def fail_cleanup():
+                raise self._winerror_145()
+            temporary = SimpleNamespace(
+                name=str(locked_path),
+                cleanup=fail_cleanup,
+            )
+            output = root / "completed.mp4"
+            with patch.object(service, "_root", return_value=root), \
+                 patch.object(service.tempfile, "TemporaryDirectory", return_value=temporary), \
+                 patch.object(service, "_remove_temporary_tree", side_effect=self._winerror_145()), \
+                 patch.object(service, "_schedule_deferred_temporary_cleanup") as defer, \
+                 patch.object(service.time, "sleep"), \
+                 self.assertLogs(service.__name__, level="WARNING"):
+                with service._temporary_directory("frames-"):
+                    output.write_bytes(b"finished video")
+            self.assertEqual(output.read_bytes(), b"finished video")
+            defer.assert_called_once_with(locked_path)
+
+    def test_refinement_adapter_retains_huggingface_source_subfolder(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            calls = []
+            def download(**kwargs):
+                calls.append(kwargs)
+                path = root / kwargs['targetFolderList'][0] / kwargs['sourceFolderList'][0] / kwargs['fileList'][0][0]
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b'adapter')
+            def locate(relative, error_if_none=True):
+                path = root / relative
+                if path.is_file():
+                    return str(path)
+                if error_if_none:
+                    raise FileNotFoundError(relative)
+            with patch.dict(sys.modules, {'wgp': SimpleNamespace(process_files_def=download)}), \
+                 patch('shared.utils.files_locator.locate_file', side_effect=locate):
+                first = runtime.ensure_refinement_adapter()
+                self.assertEqual(Path(first).read_bytes(), b'adapter')
+                self.assertEqual(runtime.ensure_refinement_adapter(), first)
+            self.assertEqual(calls, [{
+                'repoId': 'DeepBeepMeep/MiniMax-H3',
+                'revision': '630975da14fd3c84169d6cd5092da3ce1287d137',
+                'sourceFolderList': ['loras'],
+                'targetFolderList': ['minimax_h3/face_refiner'],
+                'fileList': [[runtime.TURBO_FILE]],
+            }])
+
+    def test_tracking_assets_use_verified_revision_and_reuse_cache(self):
+        asset_names = ('face_yolov8m.pt', 'det_10g.onnx', '2d106det.onnx', 'w600k_r50.onnx')
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            calls = []
+
+            def locate(relative, error_if_none=True):
+                path = root / relative
+                if path.is_file():
+                    return str(path)
+                if error_if_none:
+                    raise FileNotFoundError(relative)
+
+            def download(**kwargs):
+                calls.append(kwargs)
+                for name in kwargs['fileList'][0]:
+                    path = root / kwargs['sourceFolderList'][0] / name
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(b'asset')
+
+            with patch.dict(sys.modules, {'wgp': SimpleNamespace(process_files_def=download)}), \
+                 patch('shared.utils.files_locator.locate_file', side_effect=locate):
+                detector, identity_dir = runtime.ensure_tracking_assets()
+                self.assertEqual((detector, identity_dir),
+                    (str(root / 'buffalo_l' / 'face_yolov8m.pt'), str(root / 'buffalo_l')))
+                self.assertEqual(runtime.ensure_tracking_assets(), (detector, identity_dir))
+
+        self.assertEqual(calls, [{
+            'repoId': 'DeepBeepMeep/MiniMax-H3',
+            'revision': '630975da14fd3c84169d6cd5092da3ce1287d137',
+            'sourceFolderList': ['buffalo_l'],
+            'fileList': [list(asset_names)],
+        }])
+
+    def test_auto_and_limits(self):
+        self.assertEqual(service.normalize_options()["face_count"], 0)
+        for key, values in {"face_count": [-1, 6, True, 1.5], "steps": [3, 9],
+                            "strength": [0, -1, 1.1, float("nan"), float("inf")],
+                            "window_frames": [23, 362], "character_ids": [["../escape"]]}.items():
+            for value in values:
+                with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                    service.normalize_options({key: value})
+
+    def test_schedule_starts_at_source_noise_and_keeps_all_steps(self):
+        video, audio = runtime.refinement_sigmas(4, 0.45, 0.75)
+        self.assertEqual(len(video), 5)
+        self.assertAlmostEqual(video[0].item(), (12 * 0.5 / (1 + 11 * 0.5)) * 0.75)
+        self.assertTrue(bool((video[:-1] > video[1:]).all()))
+        self.assertEqual(video[-1], 0)
+        self.assertEqual(audio[-1], 0)
+        # Real scheduler must see exactly these effective (scaled) sigmas.
+        from models.minimax_h3.scheduler import MiniMaxH3Scheduler
+        scheduler = MiniMaxH3Scheduler()
+        scheduler.set_timesteps(sigmas=video)
+        self.assertEqual(len(scheduler.timesteps), 4)
+        torch.testing.assert_close(scheduler.timesteps, 1 - video[:-1])
+
+    def test_windows_cover_every_frame_without_gaps(self):
+        for count in (1, 22, 124, 244, 500, 7200):
+            starts = runtime.window_starts(count)
+            self.assertEqual(starts[0], 0)
+            covered = set()
+            for start in starts:
+                covered.update(range(start, min(start + 243, count)))
+            self.assertEqual(len(covered), count)
+        for window, overlap in ((362, 18), (23, 18), (124, 124), (22, -1)):
+            with self.assertRaises(ValueError):
+                runtime.window_starts(1000, window, overlap)
+
+    def test_overlap_blending_ignores_model_default_device(self):
+        previous = torch.full((3, 18, 8, 8), 20, dtype=torch.uint8, device='cpu')
+        current = torch.full((3, 39, 8, 8), 220, dtype=torch.uint8, device='cpu')
+        # MMGP changes the default device when loading H3. A meta default
+        # reproduces accidental device inheritance without needing CUDA.
+        with torch.device('meta'):
+            result = service.blend_overlap(previous, current, 18)
+        self.assertEqual(result.device.type, 'cpu')
+        self.assertTrue(bool((result[:, 0] == 20).all()))
+        self.assertTrue(bool((result[:, 17:] == 220).all()))
+        self.assertGreater(int(result[0, 9, 0, 0]), 20)
+        self.assertLess(int(result[0, 9, 0, 0]), 220)
+
+    def test_multi_window_inference_frames_blend_and_save_without_mutating_model_output(self):
+        geometry = {"frames": 294, "width": 2, "height": 2, "fps": 24}
+        model_outputs, stitched_windows, inference_flags, encoded = [], [], [], []
+
+        class Model:
+            _interrupt = False
+
+            @torch.inference_mode()
+            def generate(self, _prompt, **kwargs):
+                value = 40 if not model_outputs else 200
+                tensor = torch.full((3, kwargs["frame_num"], 2, 2), value, dtype=torch.uint8)
+                model_outputs.append(tensor)
+                return {"x": tensor}
+
+        @contextlib.contextmanager
+        def model_context(*_args):
+            yield Model(), "minimax_h3_ref2va"
+
+        def stitch(frames, refined, _segment, **_kwargs):
+            inference_flags.append(refined.is_inference())
+            stitched_windows.append(refined.clone())
+            frames.copy_(refined.permute(1, 2, 3, 0))
+            return frames
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, destination = root / "source.mp4", root / "refined.mp4"
+            source.write_bytes(b"source video")
+            transform = {"segments": [(0, geometry["frames"])], **{
+                key: [None] * geometry["frames"]
+                for key in ("boxes", "face_rect", "weights", "detected", "active")}}
+            data = {"id": "a" * 32, "faces": [{}], "warnings": [],
+                    "transforms": [transform], **geometry}
+
+            @contextlib.contextmanager
+            def decoded(*_args):
+                yield torch.zeros((294, 2, 2, 3), dtype=torch.uint8), geometry, root
+
+            def encode(_source, output, frames, fps, *_args):
+                encoded.append((np.array(frames, copy=True), fps))
+                Path(output).write_bytes(b"refined video")
+
+            with patch.object(service, "analyze", return_value=data), \
+                 patch.object(service, "resolve_mappings", return_value=[{
+                     "track_id": 1, "character_id": None, "skip": False}]), \
+                 patch.object(service, "analysis_directory", return_value=root), \
+                 patch.object(service, "decoded_video", decoded), \
+                 patch.object(service, "audio_window", return_value=(np.zeros((1, 2)), 32000)), \
+                 patch("numpy.memmap", side_effect=lambda _path, *, shape, dtype, **_kwargs:
+                       np.zeros(shape, dtype=dtype)), \
+                 patch.object(service, "_encode", side_effect=encode), \
+                 patch.object(runtime, "refinement_model", model_context), \
+                 patch.object(face, "crop_face_track", side_effect=lambda _frames, _transform, start, stop:
+                              torch.zeros((3, stop - start, 2, 2))), \
+                 patch.object(face, "stitch", side_effect=stitch):
+                report = service.process_video(source, destination)
+
+            self.assertEqual(destination.read_bytes(), b"refined video")
+            self.assertEqual(source.read_bytes(), b"source video")
+            self.assertEqual(report["faces_refined"], 1)
+
+        self.assertEqual(len(model_outputs), 2)
+        self.assertEqual(inference_flags, [False, False])
+        self.assertTrue(all(tensor.is_inference() for tensor in model_outputs))
+        self.assertTrue(bool((model_outputs[0] == 40).all()))
+        self.assertTrue(bool((model_outputs[1] == 200).all()))
+        self.assertEqual(tuple(encoded[0][0].shape), (294, 2, 2, 3))
+        self.assertEqual(encoded[0][1], 24)
+        overlap = 243 - runtime.window_starts(294)[1]
+        weights = torch.linspace(0, torch.pi, overlap).cos().mul(-0.5).add(0.5)
+        expected = torch.full((overlap,), 40.0).lerp(torch.full((overlap,), 200.0), weights).round().to(torch.uint8)
+        torch.testing.assert_close(stitched_windows[1][0, :overlap, 0, 0], expected)
+        self.assertTrue(bool((stitched_windows[1][:, overlap:] == 200).all()))
+
+    def test_mapping_identity_is_explicit_not_character_order(self):
+        data = {"faces": [{"track_id": 1, "character_id": "a" * 16}, {"track_id": 2, "character_id": "b" * 16}]}
+        mapped = service.resolve_mappings(data, [
+            {"track_id": 2, "character_id": "a" * 16}, {"track_id": 1, "skip": True}])
+        self.assertTrue(mapped[0]["skip"])
+        self.assertEqual(mapped[1]["character_id"], "a" * 16)
+        for assignments in ([{"track_id": 1}, {"track_id": 1}], [{"track_id": 3}], [{"track_id": True}]):
+            with self.assertRaises(ValueError):
+                service.resolve_mappings(data, assignments)
+
+    def test_keep_original_overrides_auto_match(self):
+        data = {"faces": [{"track_id": 1, "character_id": "a" * 16}]}
+        self.assertIsNone(service.resolve_mappings(data, [{"track_id": 1, "character_id": None}])[0]["character_id"])
+
+    def test_changed_source_or_count_rejects_old_mappings(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(service, "_root", return_value=Path(temp)):
+            source = Path(temp) / "video.mp4"
+            source.write_bytes(b"original")
+            directory = service.analysis_directory("a" * 32)
+            directory.mkdir()
+            (directory / "analysis.json").write_text(json.dumps({"source": service.fingerprint(source), "face_count": 0}))
+            service.load_analysis("a" * 32, source, 0)
+            with self.assertRaisesRegex(ValueError, "count changed"):
+                service.load_analysis("a" * 32, source, 2)
+            source.write_bytes(b"different video")
+            with self.assertRaisesRegex(ValueError, "source video changed"):
+                service.load_analysis("a" * 32, source)
+            with self.assertRaises(ValueError):
+                service.analysis_directory("../escape")
+
+    def test_character_ids_use_real_generation_manifest_key(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "video.mp4"
+            source.with_suffix(".meta.json").write_text(json.dumps({"params": {"minimax_h3_references": [
+                {"type": "video", "library_character_id": "a" * 16},
+                {"type": "audio", "library_character_id": "a" * 16},
+                {"type": "video", "library_character_id": "b" * 16}]}}))
+            self.assertEqual(service.source_characters(source), ["a" * 16, "b" * 16])
+
+    def test_track_survives_absence_and_cut_without_merging_people(self):
+        left, right = [0, 0, 40, 40], [80, 0, 120, 40]
+        a, b = np.array([1., 0.]), np.array([0., 1.])
+        detections = [[left, right], [], [right, left]]
+        tracks = face._associate_tracks(detections, [[a, b], [], [a, b]], 0.28, shot_boundaries=[2])
+        self.assertEqual(len(tracks), 2)
+        for track in tracks:
+            if np.dot(track["anchor"], a) > 0.9:
+                self.assertEqual(track["boxes"], [left, None, right])
+
+    def test_composite_preserves_background_and_absent_frames(self):
+        frames = torch.full((2, 128, 128, 3), 70, dtype=torch.uint8)
+        refined = torch.full((3, 2, 64, 64), 200, dtype=torch.uint8)
+        transform = {"boxes": [(40, 40, 48, 48)] * 2, "face_rect": [(16, 16, 32, 32)] * 2,
+                     "canvas": (64, 64), "src_size": (128, 128), "weights": [1., 0.], "detected": [True, False]}
+        with patch("torch.cuda.is_available", return_value=False):
+            result = face.stitch(frames, refined, transform, feather=2, mask_dilation=0, colour_match=0)
+        self.assertEqual(tuple(result.shape), (2, 128, 128, 3))
+        self.assertTrue(bool((result[:, :20] == 70).all()))
+        self.assertTrue(bool((result[1] == 70).all()))
+        self.assertGreater(int(result[0, 64, 64, 0]), 70)
+
+    def test_automatic_character_matching_rejects_weak_and_ambiguous_matches(self):
+        frames = torch.zeros(1, 64, 64, 3, dtype=torch.uint8)
+        box = [0, 0, 40, 40]
+        references = [object(), object()]
+        for similarities, expected in (([0.38, 0.2], False), ([0.52, 0.49], False), ([0.8, 0.3], True)):
+            with self.subTest(similarities=similarities), \
+                 patch.object(face, "_insightface_app"), \
+                 patch.object(face, "_release_insightface", return_value=False), \
+                 patch.object(face, "_aligned_embeddings", return_value=[np.array([1., 0.])]), \
+                 patch.object(face, "_embeddings", side_effect=[[(box, np.array([s, (1 - s * s)**0.5]))] for s in similarities]):
+                tracks = face._select_tracks(frames, [[box]], reference_images=references,
+                    reference_threshold=0.5, reference_margin=0.08)
+            self.assertEqual("reference_image" in tracks[0], expected)
+            if expected:
+                self.assertIs(tracks[0]["reference_image"], references[0])
+
+    def test_no_faces_is_exact_copy_and_never_loads_h3(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source, destination = Path(temp) / "source.mp4", Path(temp) / "copy.mp4"
+            source.write_bytes(b"original video bytes")
+            data = {"id": "a" * 32, "faces": [], "warnings": []}
+            with patch.object(service, "analyze", return_value=data), patch.object(runtime, "refinement_model") as model:
+                result = service.process_video(source, destination)
+                self.assertTrue(result["unchanged"])
+                self.assertEqual(source.read_bytes(), destination.read_bytes())
+                model.assert_not_called()
+
+    def test_cancel_does_not_publish_a_copy(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source, destination = Path(temp) / "source.mp4", Path(temp) / "copy.mp4"
+            source.write_bytes(b"original")
+            with patch.object(service, "analyze", return_value={"id": "a" * 32, "faces": [], "warnings": []}):
+                with self.assertRaises(ProcessingCancelled):
+                    service.process_video(source, destination, abort=lambda: True)
+            self.assertFalse(destination.exists())
+            self.assertEqual(source.read_bytes(), b"original")
+
+    def test_cancellation_during_copy_removes_partial_destination(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source, destination = Path(temp) / "source.mp4", Path(temp) / "copy.mp4"
+            source.write_bytes(b"a" * (3 * 1024 * 1024))
+            with patch.object(service, "analyze", return_value={"id": "a" * 32, "faces": [], "warnings": []}):
+                cancelled = iter([False, False, True])
+                with self.assertRaises(ProcessingCancelled):
+                    service.process_video(source, destination, abort=lambda: next(cancelled))
+            self.assertFalse(destination.exists())
+
+    def test_no_faces_transcodes_when_destination_container_differs(self):
+        @contextlib.contextmanager
+        def decoded(*args):
+            yield np.zeros((2, 16, 16, 3), dtype=np.uint8), {"fps": 30}, None
+        with tempfile.TemporaryDirectory() as temp:
+            source, destination = Path(temp) / "source.webm", Path(temp) / "copy.mp4"
+            source.write_bytes(b"webm bytes")
+            with patch.object(service, "analyze", return_value={"id": "a" * 32, "faces": [], "warnings": []}), \
+                 patch.object(service, "decoded_video", decoded), patch.object(service, "_encode") as encode:
+                service.process_video(source, destination)
+                encode.assert_called_once()
+
+    def test_refinement_wrapper_pads_short_segment_and_discards_model_audio(self):
+        class Model:
+            _interrupt = False
+            def generate(self, _prompt, **kwargs):
+                self.kwargs = kwargs
+                return {"x": kwargs["input_frames"], "audio": "must not escape"}
+        model = Model()
+        crop = torch.zeros(3, 9, 32, 32)
+        output = runtime.refine_window(model, crop, "reference.png", fps=30,
+            audio=np.zeros((9600, 2)), audio_rate=32000, options=service.normalize_options(), seed=17)
+        self.assertEqual(model.kwargs["frame_num"], 22)
+        self.assertEqual(model.kwargs["fps"], 30)
+        self.assertEqual(tuple(output.shape), tuple(crop.shape))
+        self.assertEqual(output.dtype, torch.uint8)
+
+    def test_refinement_wrapper_preserves_uint8_decoder_output_and_trims_padding(self):
+        class Model:
+            _interrupt = False
+            def generate(self, _prompt, **kwargs):
+                self.kwargs = kwargs
+                output = torch.empty((3, kwargs["frame_num"], 32, 32), dtype=torch.uint8)
+                values = torch.tensor([0, 1, 64, 128, 255, 0, 1, 64, 128], dtype=torch.uint8)
+                repeats = (kwargs["frame_num"] + len(values) - 1) // len(values)
+                values = values.repeat(repeats)[:kwargs["frame_num"]]
+                output[:] = values.view(1, -1, 1, 1)
+                self.output = output
+                self.output_before = output.clone()
+                return {"x": output, "audio": torch.tensor([1.0])}
+
+        model = Model()
+        crop = torch.linspace(-1.0, 1.0, 3 * 9 * 32 * 32).reshape(3, 9, 32, 32)
+        original_crop = crop.clone()
+        audio = np.arange(9600 * 2, dtype=np.float32).reshape(9600, 2)
+        original_audio = audio.copy()
+        output = runtime.refine_window(model, crop, "reference.png", fps=30,
+            audio=audio, audio_rate=32000, options=service.normalize_options(), seed=17)
+
+        self.assertEqual(model.kwargs["frame_num"], 22)
+        self.assertEqual(tuple(model.kwargs["input_frames"].shape), (3, 22, 32, 32))
+        torch.testing.assert_close(model.kwargs["input_frames"][:, 9:], crop[:, -1:].expand(-1, 13, -1, -1))
+        self.assertEqual(tuple(output.shape), tuple(crop.shape))
+        self.assertEqual(output.dtype, torch.uint8)
+        self.assertEqual(output.device.type, "cpu")
+        self.assertFalse(output.requires_grad)
+        torch.testing.assert_close(output[:, :, 0, 0], model.output[:, :9, 0, 0])
+        self.assertEqual(output[0, :, 0, 0].tolist(), [0, 1, 64, 128, 255, 0, 1, 64, 128])
+        torch.testing.assert_close(model.output, model.output_before)
+        torch.testing.assert_close(crop, original_crop)
+        np.testing.assert_array_equal(audio, original_audio)
+
+    def test_refinement_wrapper_converts_signed_float_output_once_without_mutation(self):
+        class Model:
+            _interrupt = False
+            def generate(self, _prompt, **kwargs):
+                self.kwargs = kwargs
+                values = torch.tensor([-1.0, 0.0, 1.0], dtype=torch.float32)
+                repeats = (kwargs["frame_num"] + len(values) - 1) // len(values)
+                values = values.repeat(repeats)[:kwargs["frame_num"]]
+                output = values.view(1, kwargs["frame_num"], 1, 1).expand(3, -1, 32, 32).clone()
+                output[:, 3:] = 0.0
+                output.requires_grad_()
+                self.output = output
+                self.output_before = output.detach().clone()
+                return {"x": output}
+
+        model = Model()
+        crop = torch.zeros(3, 3, 32, 32)
+        original_crop = crop.clone()
+        audio = np.zeros((3200, 2), dtype=np.float32)
+        original_audio = audio.copy()
+        output = runtime.refine_window(model, crop, "reference.png", fps=24,
+            audio=audio, audio_rate=32000, options=service.normalize_options(), seed=29)
+
+        self.assertEqual(model.kwargs["frame_num"], 22)
+        self.assertEqual(tuple(output.shape), (3, 3, 32, 32))
+        self.assertEqual(output.dtype, torch.uint8)
+        self.assertEqual(output.device.type, "cpu")
+        self.assertFalse(output.requires_grad)
+        self.assertEqual(output[0, :, 0, 0].tolist(), [0, 128, 255])
+        torch.testing.assert_close(crop, original_crop)
+        torch.testing.assert_close(model.output, model.output_before)
+        np.testing.assert_array_equal(audio, original_audio)
+
+
+if __name__ == "__main__":
+    unittest.main()

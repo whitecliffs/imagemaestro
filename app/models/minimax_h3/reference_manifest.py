@@ -1,0 +1,345 @@
+"""Dependency-light validation for MiniMax H3 Omni reference manifests.
+
+Prompt planning and API preflight need to validate reference metadata before
+the generation runtime (and therefore PyTorch) is loaded.  Keep this module
+limited to the Python standard library so those paths remain usable in
+lightweight tools and CI.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+from pathlib import Path
+
+from services.h3_reference_audio import VIDEO_AUDIO_ROLES
+
+
+MINIMAX_H3_MAX_REFERENCE_IMAGES = 9
+MINIMAX_H3_MAX_REFERENCE_VIDEOS = 3
+MINIMAX_H3_MAX_REFERENCE_AUDIOS = 3
+MINIMAX_H3_MAX_REFERENCES = 12
+
+_IMAGE_EXTENSIONS = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
+_VIDEO_EXTENSIONS = {".avi", ".m4v", ".mkv", ".mov", ".mp4", ".webm"}
+_AUDIO_EXTENSIONS = {".aac", ".flac", ".m4a", ".mp3", ".ogg", ".wav"}
+_AUDIO_INTENTS = {"voice", "drive", "style", "sound"}
+_IMAGE_INTENTS = {"identity", "object", "scene", "style", "composition"}
+_VIDEO_INTENTS = {"character", "motion", "scene"}
+_AUDIO_REFERENCE_TAG_RE = re.compile(
+    r"(?P<tag><Audio\s+(?P<tag_index>\d+)>)|(?P<plain>\bAudio\s+(?P<plain_index>\d+)\b)",
+    re.IGNORECASE,
+)
+_EXACT_DRIVE_PROMPT_MARKER = "EXACT TARGET SOUNDTRACK"
+
+
+def validate_reference_manifest(
+    references,
+    *,
+    require_files: bool = True,
+    require_visual: bool = True,
+    allow_empty: bool = False,
+) -> list[dict]:
+    """Validate and canonicalize Maestro's JSON Ref2VA manifest.
+
+    Generation keeps the strict defaults: it needs an uploaded image or
+    video whose files still exist. Prompt planning is intentionally looser;
+    it can describe an Omni sequence before media is added, while the user is
+    still building an audio-first manifest, or after a saved file moved.
+    """
+
+    if not isinstance(references, list) or not references:
+        if allow_empty and (references is None or references == []):
+            return []
+        raise ValueError("MiniMax H3 Omni Reference needs at least one image or video reference.")
+    if len(references) > MINIMAX_H3_MAX_REFERENCES:
+        raise ValueError(
+            f"MiniMax H3 accepts at most {MINIMAX_H3_MAX_REFERENCES} references, got {len(references)}."
+        )
+
+    normalized: list[dict] = []
+    counts = {"image": 0, "video": 0, "audio": 0}
+    drive_audio_count = 0
+    allowed = {"image": _IMAGE_EXTENSIONS, "video": _VIDEO_EXTENSIONS, "audio": _AUDIO_EXTENSIONS}
+    for index, raw in enumerate(references):
+        if not isinstance(raw, dict):
+            raise ValueError(f"Reference {index + 1} must be an object.")
+        kind = str(raw.get("type") or raw.get("kind") or "").strip().lower()
+        if kind not in allowed:
+            raise ValueError(f"Reference {index + 1} must be an image, video, or audio reference.")
+        path = str(raw.get("path") or "").strip()
+        if not path:
+            raise ValueError(f"Reference {index + 1} has no uploaded file.")
+        if require_files and not os.path.isfile(path):
+            raise ValueError(f"Reference {index + 1} file was not found: {path}")
+        extension = os.path.splitext(path)[1].lower()
+        if extension and extension not in allowed[kind]:
+            raise ValueError(
+                f"Reference {index + 1} is marked as {kind}, but {extension or 'its file'} is not a supported {kind} format."
+            )
+
+        counts[kind] += 1
+        item = dict(raw)
+        item["type"] = kind
+        item["path"] = path
+        item["role"] = str(raw.get("role") or "").strip()[:500]
+        refmod_path = str(raw.get("refmod_path") or "").strip()
+        if refmod_path:
+            if kind == "audio":
+                raise ValueError("RefMods attach to visual references; use the saved voice as a separate audio reference.")
+            resolved = Path(refmod_path).resolve()
+            library_root = (Path.cwd() / "uploads" / "characters").resolve()
+            if not resolved.is_relative_to(library_root):
+                raise ValueError("Import this RefMod into Maestro's character library first.")
+            if require_files:
+                from services.refmod import inspect_refmod
+                info = inspect_refmod(resolved)
+                if info["refmod"]["kind"] != kind:
+                    raise ValueError("The RefMod and its visual reference have different media kinds.")
+            item["refmod_path"] = str(resolved)
+            if raw.get("remove_background"):
+                raise ValueError("Background removal cannot change an encoded RefMod. Use an original image reference for that option.")
+        library_character_id = str(raw.get("library_character_id") or "").strip()[:128]
+        character_name = str(raw.get("character_name") or "").strip()[:120]
+        if library_character_id:
+            item["library_character_id"] = library_character_id
+        if character_name:
+            item["character_name"] = character_name
+        if kind == "image":
+            image_intent = str(raw.get("image_intent") or "identity").strip().lower()
+            if image_intent not in _IMAGE_INTENTS:
+                choices = ", ".join(sorted(_IMAGE_INTENTS))
+                raise ValueError(
+                    f"Reference {index + 1} has invalid image intent "
+                    f"{image_intent!r}; expected one of: {choices}."
+                )
+            item["image_intent"] = image_intent
+            remove_background = raw.get("remove_background")
+            if remove_background is None:
+                # Preserve the original image and its lighting by default.
+                # Isolation is useful when a source background leaks into the
+                # target, but it can make the result look composited, so it is
+                # always an explicit per-reference choice.
+                remove_background = False
+            elif not isinstance(remove_background, bool):
+                raise ValueError(
+                    f"Reference {index + 1} remove_background must be true or false."
+                )
+            # Characters and objects can be isolated from their source scene.
+            # Locations, styles, and composition references retain surroundings.
+            item["remove_background"] = bool(
+                remove_background and image_intent in {"identity", "object"}
+            )
+        if kind == "audio":
+            audio_intent = str(raw.get("audio_intent") or "voice").strip().lower()
+            if audio_intent not in _AUDIO_INTENTS:
+                choices = ", ".join(sorted(_AUDIO_INTENTS))
+                raise ValueError(
+                    f"Reference {index + 1} has invalid audio intent {audio_intent!r}; "
+                    f"expected one of: {choices}."
+                )
+            item["audio_intent"] = audio_intent
+            if audio_intent == "drive":
+                drive_audio_count += 1
+        if kind == "video":
+            video_intent = str(raw.get("video_intent") or "motion").strip().lower()
+            if video_intent not in _VIDEO_INTENTS:
+                choices = ", ".join(sorted(_VIDEO_INTENTS))
+                raise ValueError(
+                    f"Reference {index + 1} has invalid video intent "
+                    f"{video_intent!r}; expected one of: {choices}."
+                )
+            item["video_intent"] = video_intent
+            follow_timeline = raw.get("follow_timeline")
+            if follow_timeline is None:
+                follow_timeline = not bool(
+                    item.get("library_character_id")
+                    or item.get("refmod_path")
+                    or video_intent == "character"
+                )
+            elif not isinstance(follow_timeline, bool):
+                raise ValueError(
+                    f"Reference {index + 1} follow_timeline must be true or false."
+                )
+            if item.get("refmod_path") and follow_timeline:
+                raise ValueError(
+                    "An encoded RefMod video cannot follow the timeline; use the original video reference."
+                )
+            item["follow_timeline"] = follow_timeline
+            video_audio_role = raw.get("video_audio_role")
+            if video_audio_role is not None and str(video_audio_role).strip():
+                video_audio_role = str(video_audio_role).strip().lower()
+                if video_audio_role not in VIDEO_AUDIO_ROLES:
+                    choices = ", ".join(sorted(VIDEO_AUDIO_ROLES))
+                    raise ValueError(
+                        f"Reference {index + 1} has invalid video audio role "
+                        f"{video_audio_role!r}; expected one of: {choices}."
+                    )
+                item["video_audio_role"] = video_audio_role
+                if (
+                    video_audio_role in {"drive", "voice", "style", "sound"}
+                    and not item.get("_h3_video_audio_source_id")
+                ):
+                    counts["audio"] += 1
+                    if video_audio_role == "drive":
+                        drive_audio_count += 1
+                # An explicit dropdown choice owns audio independently from
+                # the legacy checkbox saved by older jobs.
+                item["include_audio"] = video_audio_role == "legacy"
+            else:
+                item["include_audio"] = bool(raw.get("include_audio", True))
+            audio_path = str(raw.get("audio_path") or "").strip()
+            if audio_path:
+                if require_files and not os.path.isfile(audio_path):
+                    raise ValueError(f"Reference {index + 1} soundtrack was not found: {audio_path}")
+                audio_extension = os.path.splitext(audio_path)[1].lower()
+                if audio_extension and audio_extension not in _AUDIO_EXTENSIONS:
+                    raise ValueError(f"Reference {index + 1} soundtrack is not a supported audio file.")
+                item["audio_path"] = audio_path
+        normalized.append(item)
+
+    for kind, limit in (
+        ("image", MINIMAX_H3_MAX_REFERENCE_IMAGES),
+        ("video", MINIMAX_H3_MAX_REFERENCE_VIDEOS),
+        ("audio", MINIMAX_H3_MAX_REFERENCE_AUDIOS),
+    ):
+        if counts[kind] > limit:
+            raise ValueError(f"MiniMax H3 accepts at most {limit} {kind} references, got {counts[kind]}.")
+    if require_visual and counts["image"] + counts["video"] == 0:
+        raise ValueError("Audio references cannot be used alone; add at least one image or video reference.")
+    if drive_audio_count > 1:
+        raise ValueError(
+            "MiniMax H3 accepts one Music / performance timeline. "
+            "Use Voice reference, Sound effect reference, or Music / sound style only for additional audio references."
+        )
+    return normalized
+
+
+def object_reference_prompt_contract(picture_label: str, role: str = "") -> tuple[str, str]:
+    """Describe an object image without allocating a character or speaker."""
+
+    name = " ".join(str(role or "the requested object").split())[:500]
+    return (
+        f"{picture_label} is an object / prop reference for {name}; preserve its design, "
+        "shape, proportions, materials, colors, and distinguishing details. The target "
+        "prompt determines its count, scale, placement, and action; the reference "
+        "background, camera, composition, and pose do not define the target scene. "
+        "Preserve source-established relationships when other references show views or "
+        "features of this same object; another image alone does not add a physical "
+        "instance. Keep source-distinct objects and their requested counts distinct.",
+        f"{picture_label}: fully_preserved - preserve the requested object's design "
+        "and appearance while rendering it naturally inside the target scene.",
+    )
+
+
+def split_exact_drive_audio_reference(references) -> tuple[list[dict], str | None, int | None]:
+    """Separate Studio Omni's exact soundtrack from creative references.
+
+    Ref2VA reference audio is intentionally generative: it can borrow a voice,
+    rhythm, or performance, but it does not freeze the supplied waveform on the
+    target timeline. Maestro's ``drive`` intent promises the latter. The
+    generation request therefore sends that one file through H3's target-audio
+    conditioning path and keeps visual, voice, style, and sound-effect media in the packed
+    Omni reference sequence.
+
+    Standalone drive audio returns its original ``<Audio N>`` number so old
+    enhanced prompts can be repaired just before text encoding. A video-derived
+    drive has no Audio ordinal in the user's manifest, so it never returns one.
+    """
+
+    from services.h3_reference_audio import canonicalize_video_audio_roles
+
+    items = canonicalize_video_audio_roles(
+        [dict(item) for item in (references or []) if isinstance(item, dict)]
+    )
+    runtime_references: list[dict] = []
+    drive_path: str | None = None
+    drive_ordinal: int | None = None
+    audio_ordinal = 0
+    derived_video_by_source = {
+        str(item.get("_h3_video_audio_source_id")): item
+        for item in items
+        if str(item.get("type") or item.get("kind") or "").strip().lower() == "video"
+        and item.get("_h3_video_audio_source_id")
+    }
+
+    for item in items:
+        kind = str(item.get("type") or item.get("kind") or "").strip().lower()
+        if kind == "video":
+            if (
+                (item.get("has_audio") or item.get("audio_path"))
+                and item.get("include_audio", True)
+            ):
+                audio_ordinal += 1
+            runtime_references.append(item)
+            continue
+        if kind != "audio":
+            runtime_references.append(item)
+            continue
+
+        audio_intent = str(item.get("audio_intent") or "voice").strip().lower()
+        source_id = str(item.get("_h3_video_audio_source_id") or "")
+        source_video = derived_video_by_source.get(source_id)
+        video_drive = bool(
+            source_video
+            and str(source_video.get("video_audio_role") or "").strip().lower() == "drive"
+        )
+
+        # Exact video soundtracks are not numbered by the UI/context layer.
+        # Do not let their hidden runtime row consume or rewrite another
+        # reference's Audio ordinal.
+        if not video_drive:
+            audio_ordinal += 1
+
+        if audio_intent != "drive":
+            runtime_references.append(item)
+            continue
+        if drive_path is not None:
+            raise ValueError(
+                "MiniMax H3 accepts one Music / performance timeline. "
+                "Use Voice reference, Sound effect reference, or Music / sound style only for additional audio references."
+            )
+        drive_path = str(item.get("path") or "").strip() or None
+        drive_ordinal = None if video_drive else audio_ordinal
+        if source_id and source_id in derived_video_by_source:
+            derived_video_by_source[source_id]["_h3_video_audio_role_routed"] = True
+            derived_video_by_source[source_id]["_h3_video_audio_routed_role"] = "drive"
+
+    return runtime_references, drive_path, drive_ordinal
+
+
+def apply_exact_drive_audio_prompt_contract(prompt, removed_audio_ordinal: int | None) -> str:
+    """Remove a routed drive-audio tag and preserve later audio numbering."""
+
+    text = str(prompt or "").strip()
+    try:
+        removed = int(removed_audio_ordinal or 0)
+    except (TypeError, ValueError):
+        removed = 0
+
+    if removed > 0 and text:
+        def replace_tag(match: re.Match) -> str:
+            raw_index = match.group("tag_index") or match.group("plain_index")
+            index = int(raw_index)
+            if index == removed:
+                return "the exact target soundtrack"
+            if index < removed:
+                return match.group(0)
+            shifted = index - 1
+            return (
+                f"<Audio {shifted}>"
+                if match.group("tag") is not None
+                else f"Audio {shifted}"
+            )
+
+        text = _AUDIO_REFERENCE_TAG_RE.sub(replace_tag, text)
+
+    if not text or _EXACT_DRIVE_PROMPT_MARKER in text:
+        return text
+    return (
+        f"{_EXACT_DRIVE_PROMPT_MARKER} (highest priority): Preserve the supplied "
+        "soundtrack waveform and timing exactly on the target timeline. Synchronize "
+        "visible performance, body movement, cuts, and lip movement to that audio. "
+        "Do not reinterpret, replace, restart, or regenerate the music or spoken words.\n\n"
+        f"{text}"
+    )

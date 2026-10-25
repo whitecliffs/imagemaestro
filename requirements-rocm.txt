@@ -1,0 +1,9 @@
+# Requirements for AMD ROCm / Linux (RDNA2, RDNA3, RDNA4, CDNA)
+# PyTorch with ROCm is installed first via:
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm6.4
+
+-r requirements-base.txt
+
+# ONNX runtime and vision utilities
+onnxruntime>=1.18.0
+rembg>=2.0.50

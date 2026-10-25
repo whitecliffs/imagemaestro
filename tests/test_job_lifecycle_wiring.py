@@ -1,0 +1,854 @@
+"""Static wiring checks that avoid importing Maestro's heavyweight server."""
+from __future__ import annotations
+
+import ast
+import os
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
+
+
+_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(_ROOT, "app"))
+
+
+def _parse(relative_path: str) -> ast.Module:
+    with open(os.path.join(_ROOT, relative_path), "r", encoding="utf-8") as handle:
+        return ast.parse(handle.read(), filename=relative_path)
+
+
+def _function(tree: ast.AST, name: str) -> ast.FunctionDef:
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+            return node
+    raise AssertionError(f"Function {name!r} not found")
+
+
+def _called_names(node: ast.AST) -> set[str]:
+    names = set()
+    for child in ast.walk(node):
+        if not isinstance(child, ast.Call):
+            continue
+        if isinstance(child.func, ast.Name):
+            names.add(child.func.id)
+        elif isinstance(child.func, ast.Attribute):
+            names.add(child.func.attr)
+    return names
+
+
+def _load_isolated_function(relative_path: str, name: str, namespace: dict):
+    function = _function(_parse(relative_path), name)
+    module = ast.Module(body=[function], type_ignores=[])
+    ast.fix_missing_locations(module)
+    exec(compile(module, relative_path, "exec"), namespace)
+    return namespace[name]
+
+
+class TestJobLifecycleWiring(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.launch = _parse("app/launch.py")
+
+    def test_optional_finishing_warnings_survive_status_and_browser_reconnection(self):
+        from app.services.job_lifecycle import snapshot_job
+        warning = "DLSS finishing failed; the generated original was kept."
+        base = {"status": "completed", "progress": 100, "message": "Done",
+                "output_files": ["clip.mp4"], "error": None, "params": {}, "created_at": 1}
+        jobs = {
+            "warning": {**base, "id": "warning", "finishing_warnings": [warning]},
+            "ordinary": {**base, "id": "ordinary"},
+            "dismissed": {**base, "id": "dismissed", "finishing_warnings": [warning], "dismissed": True},
+        }
+        namespace = {"_jobs": jobs, "snapshot_job": snapshot_job,
+                     "public_enhancement": lambda record, **_kwargs: record,
+                     "_director_job_response_fields": lambda _job: {},
+                     "_job_eta_response_fields": lambda _job: {},
+                     "_generation_previews": SimpleNamespace(fields=lambda _job: {})}
+        for name in ("get_status", "list_jobs"):
+            function = _function(_parse("app/launch.py"), name)
+            function.decorator_list = []
+            exec(compile(ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[])),
+                         "launch.py", "exec"), namespace)
+        status = namespace["get_status"]("warning")
+        self.assertEqual(status["status"], "completed")
+        self.assertEqual(status["output_files"], ["clip.mp4"])
+        self.assertEqual(status["finishing_warnings"], [warning])
+        self.assertEqual(namespace["get_status"]("ordinary")["finishing_warnings"], [])
+        history = namespace["list_jobs"]()["jobs"]
+        self.assertEqual([job["job_id"] for job in history], ["warning"])
+        self.assertEqual(history[0]["finishing_warnings"], [warning])
+
+    def test_completion_push_reports_finishing_warning_without_calling_it_generation_failure(self):
+        notices = []
+        namespace = {"_play_host_completion_sound": lambda: None,
+                     "_web_push": SimpleNamespace(dispatch=lambda **notice: notices.append(notice))}
+        notify = _load_isolated_function("app/launch.py", "_on_generation_job_terminal", namespace)
+        warning = "Media Flow failed; the generated original was kept."
+        notify({"id": "warning", "finishing_warnings": [warning]}, "completed")
+        self.assertEqual(notices[0]["category"], "completion")
+        self.assertEqual(notices[0]["title"], "Studio generation complete with warnings")
+        self.assertEqual(notices[0]["body"], warning)
+        notify({"id": "ordinary"}, "completed")
+        self.assertEqual(notices[1]["title"], "Studio generation complete")
+        self.assertEqual(notices[1]["body"], "Your Maestro generation is ready.")
+
+    def test_studio_finishing_and_metadata_failures_keep_generation_successful(self):
+        from services import media_flow, media_info
+        from services.job_lifecycle import finish_job, is_cancel_requested, update_job
+        worker = _function(_parse("app/launch.py"), "_run_generation")
+        branch = next(node for node in ast.walk(worker) if isinstance(node, ast.If)
+                      and ast.unparse(node.test) == "success and (pp_media_spatial or pp_media_temporal)")
+        code = compile(ast.fix_missing_locations(ast.Module(body=[branch], type_ignores=[])),
+                       "studio-optional-finishing", "exec")
+        for failure in ("native", "before_probe", "after_metadata", "cancelled"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as folder:
+                source = os.path.join(folder, "clip.mp4")
+                with open(source, "wb") as output:
+                    output.write(b"original video")
+                job = {"id": "optional-finishing", "status": "running", "error": None}
+                processing = {}
+
+                def process(*_args, **_kwargs):
+                    if failure == "native":
+                        raise RuntimeError("NGX 0xBAD00000")
+                    if failure == "cancelled":
+                        job["cancel_requested"] = True
+                        raise media_flow.ProcessingCancelled("cancelled")
+                    with open(source, "wb") as output:
+                        output.write(b"finished video")
+
+                namespace = {"success": True, "pp_media_spatial": "dlss5*1.5",
+                             "pp_media_temporal": "", "pp_media_options": {},
+                             "wgp": SimpleNamespace(release_model=lambda: None),
+                             "new_files": ["clip.mp4"], "out_dir": folder, "os": os, "time": time,
+                             "job": job, "processing_by_output": processing,
+                             "update_job": update_job, "is_cancel_requested": is_cancel_requested,
+                             "traceback": SimpleNamespace(print_exc=lambda: None), "print": lambda *_: None}
+                with patch.object(media_flow, "process_generation_video", side_effect=process) as stage, \
+                     patch.object(media_info, "probe_media", side_effect=(
+                         RuntimeError("probe failed") if failure == "before_probe" else None), return_value={}), \
+                     patch.object(media_info, "processing_record", side_effect=(
+                         RuntimeError("metadata failed") if failure == "after_metadata" else None), return_value={}):
+                    if failure == "cancelled":
+                        with self.assertRaises(media_flow.ProcessingCancelled):
+                            exec(code, namespace)
+                        self.assertFalse(finish_job(job, "completed"))
+                        self.assertEqual(job["status"], "cancelled")
+                        self.assertNotIn("finishing_warnings", job)
+                        continue
+                    exec(code, namespace)
+                self.assertTrue(finish_job(job, "completed", output_files=["clip.mp4"]))
+                self.assertEqual(job["status"], "completed")
+                self.assertIsNone(job["error"])
+                self.assertEqual(len(job["finishing_warnings"]), 1)
+                self.assertEqual(processing["clip.mp4"]["warnings"], job["finishing_warnings"])
+                with open(source, "rb") as output:
+                    self.assertEqual(output.read(), b"finished video" if failure == "after_metadata" else b"original video")
+                if failure == "before_probe":
+                    stage.assert_not_called()
+                if failure == "after_metadata":
+                    self.assertIn("completed", job["finishing_warnings"][0])
+                    self.assertNotIn("original was kept", job["finishing_warnings"][0])
+
+    def test_stream_error_survives_the_final_queue_status(self):
+        from app.services.job_lifecycle import update_job, finish_job
+        worker = _function(self.launch, '_run_generation')
+        branch = next(node for node in ast.walk(worker) if isinstance(node, ast.If)
+                      and ast.unparse(node.test) == "cmd == 'error'")
+        terminal = next(node for node in ast.walk(worker) if isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Name) and node.func.id == 'finish_job'
+                        and any(isinstance(value, ast.Constant) and value.value == 'Generation failed'
+                                for value in ast.walk(node)))
+        module = ast.fix_missing_locations(ast.Module(body=[*branch.body, ast.Expr(value=terminal)], type_ignores=[]))
+        job = {'id': 'failed-cover', 'status': 'running', 'error': None}
+        namespace = {'job': job, 'data': 'Notation package could not load', 'success': False,
+                     'update_job': update_job, 'finish_job': finish_job, 'print': lambda *args: None}
+        exec(compile(module, 'generation-error-stream', 'exec'), namespace)
+        self.assertEqual(job['status'], 'failed')
+        self.assertEqual(job['error'], 'Notation package could not load')
+        self.assertEqual(job['message'], 'Error: Notation package could not load')
+
+    def test_skipped_or_outputless_generation_never_emits_completed(self):
+        from app.services.job_lifecycle import finish_job, register_terminal_listener, unregister_terminal_listener, update_job
+        worker = _function(self.launch, "_run_generation")
+        success_assignment = next(node for node in ast.walk(worker) if isinstance(node, ast.Assign)
+                                  and any(isinstance(target, ast.Name) and target.id == "success" for target in node.targets))
+        output_guard = next(node for node in ast.walk(worker) if isinstance(node, ast.If)
+                            and ast.unparse(node.test) == "not new_files")
+        terminal = next(node for node in ast.walk(worker) if isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Name) and node.func.id == "finish_job"
+                        and any(isinstance(value, ast.Constant) and value.value == "Generation failed"
+                                for value in ast.walk(node)))
+        module = ast.fix_missing_locations(ast.Module(
+            body=[success_assignment, output_guard, ast.Expr(value=terminal)], type_ignores=[],
+        ))
+        observed_statuses = []
+        listener = lambda job, status: observed_statuses.append(status)
+        register_terminal_listener(listener)
+        try:
+            for total, completed, files, error, status in (
+                (1, 0, [], "Task 1 failed validation", "failed"),
+                (2, 1, ["partial.mp4"], "Task 2 failed validation", "failed"),
+                (1, 1, [], None, "failed"),
+                (0, 0, [], None, "failed"),
+                (1, 1, ["clip.mp4"], None, "completed"),
+                (2, 2, ["first.mp4", "second.mp4"], None, "completed"),
+            ):
+                with self.subTest(total=total, completed=completed, files=files):
+                    job = {"id": "output-check", "status": "running", "error": error, "output_files": files}
+                    namespace = {
+                        "job": job, "cancelled": False, "total_tasks": total, "completed": completed,
+                        "new_files": files, "update_job": update_job, "finish_job": finish_job,
+                    }
+                    exec(compile(module, "generation-output-check", "exec"), namespace)
+                    self.assertEqual(job["status"], status)
+                    self.assertEqual(observed_statuses[-1], status)
+                    self.assertEqual(job["output_files"], files, "Partial outputs remain available on failure")
+                    if error:
+                        self.assertEqual(job["error"], error, "Keep the original validation error")
+                    elif status == "failed":
+                        self.assertIn("no output", job["error"])
+                    else:
+                        self.assertEqual(job["message"], "Done")
+        finally:
+            unregister_terminal_listener(listener)
+
+    def test_validation_skip_has_an_actionable_job_error(self):
+        from app.services.job_lifecycle import update_job
+        worker = _function(self.launch, "_run_generation")
+        invalid = next(node for node in ast.walk(worker) if isinstance(node, ast.If)
+                       and ast.unparse(node.test) == "validated_params is None")
+        # Run the actual skip branch inside its loop, retaining its continue.
+        loop = ast.For(target=ast.Name(id="_", ctx=ast.Store()),
+                       iter=ast.List(elts=[ast.Constant(value=0)], ctx=ast.Load()),
+                       body=[invalid], orelse=[])
+        module = ast.fix_missing_locations(ast.Module(body=[loop], type_ignores=[]))
+        job = {"id": "invalid-injected-frames", "status": "running", "error": None}
+        namespace = {"validated_params": None, "task_no": 1, "skipped": 0,
+                     "job": job, "update_job": update_job, "print": lambda *args: None}
+        exec(compile(module, "generation-validation-error", "exec"), namespace)
+        self.assertEqual(namespace["skipped"], 1)
+        self.assertIn("failed validation", job["error"])
+        self.assertIn("required inputs", job["message"])
+
+    def test_each_worker_uses_lifecycle_transitions(self):
+        expected = {
+            "_run_generation": {
+                "try_start", "register_abort_state", "finish_job",
+                "record_job_outputs",
+            },
+            "_run_recast": {"try_start", "register_abort_state", "try_requeue"},
+            "_run_tool_upscale": {
+                "try_start", "register_abort_state", "finish_job",
+                "record_job_outputs",
+            },
+            "_run_tool_revoice": {"try_start", "register_abort_state", "finish_job"},
+            "_run_blend_generation": {
+                "register_abort_state", "finish_job", "record_job_outputs",
+            },
+            "_run_sfx_generation": {
+                "finish_job", "record_job_outputs",
+            },
+        }
+        for function_name, required in expected.items():
+            with self.subTest(function=function_name):
+                calls = _called_names(_function(self.launch, function_name))
+                self.assertTrue(required <= calls, required - calls)
+
+    def test_cancel_endpoint_routes_through_shared_helper(self):
+        cancel = _function(self.launch, "cancel_job")
+        self.assertIn("request_cancel", _called_names(cancel))
+        self.assertFalse(any(
+            isinstance(node, ast.Attribute) and node.attr == "_interrupt"
+            for node in ast.walk(cancel)
+        ))
+
+    def test_studio_queue_uses_explicit_held_lifecycle(self):
+        generate = _function(self.launch, "generate")
+        self.assertTrue({
+            "_enqueue_deferred_generation_preparation",
+            "_prepare_generation_submission",
+        } <= _called_names(generate))
+
+        # Both the ordinary submission path and the planner-deferred path
+        # preserve held jobs without starting a worker. Automatic planning is
+        # now deliberately represented as a job before its LLM may load.
+        for function_name in (
+            "_prepare_generation_submission",
+            "_enqueue_deferred_generation_preparation",
+        ):
+            submission = _function(self.launch, function_name)
+            submission_constants = {
+                node.value
+                for node in ast.walk(submission)
+                if isinstance(node, ast.Constant) and isinstance(node.value, str)
+            }
+            self.assertIn("_queue_mode", submission_constants)
+            self.assertIn("held", submission_constants)
+            self.assertTrue(any(
+                isinstance(node, ast.If)
+                and isinstance(node.test, ast.UnaryOp)
+                and isinstance(node.test.op, ast.Not)
+                and isinstance(node.test.operand, ast.Name)
+                and node.test.operand.id == "hold_for_queue"
+                and any(
+                    isinstance(child, ast.Name)
+                    and child.id == "_run_generation"
+                    for child in ast.walk(node)
+                )
+                for node in ast.walk(submission)
+            ), function_name)
+
+        release_queue = _function(self.launch, "_start_held_studio_queue")
+        self.assertIn("release_held", _called_names(release_queue))
+
+        dispatcher = _function(self.launch, "_run_held_studio_jobs")
+        self.assertIn("_run_generation", _called_names(dispatcher))
+
+        endpoint = _function(self.launch, "start_studio_queue")
+        self.assertIn("_start_held_studio_queue", _called_names(endpoint))
+
+        list_jobs = _function(self.launch, "list_jobs")
+        list_constants = {
+            node.value
+            for node in ast.walk(list_jobs)
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        }
+        self.assertIn("held", list_constants)
+
+    def test_direct_ai_planning_submit_is_visible_and_reconnectable(self):
+        for function_name in (
+            "_prepare_generation_submission",
+            "_enqueue_deferred_generation_preparation",
+        ):
+            submission = _function(self.launch, function_name)
+            constants = {
+                node.value
+                for node in ast.walk(submission)
+                if isinstance(node, ast.Constant) and isinstance(node.value, str)
+            }
+            self.assertIn("_client_submission_id", constants)
+            self.assertIn("client_submission_id", constants)
+            self.assertIn("show_in_gallery", constants)
+
+        with open(
+            os.path.join(_ROOT, "ui", "src", "stores", "useStore.ts"),
+            "r",
+            encoding="utf-8",
+        ) as handle:
+            store = handle.read()
+        with open(
+            os.path.join(
+                _ROOT,
+                "ui",
+                "src",
+                "components",
+                "MainContent",
+                "MainContent.tsx",
+            ),
+            "r",
+            encoding="utf-8",
+        ) as handle:
+            gallery = handle.read()
+        self.assertIn("pendingJobId", store)
+        self.assertIn("_client_submission_id", store)
+        self.assertIn("job.client_submission_id === clientSubmissionId", store)
+        self.assertIn("showInGallery: j.show_in_gallery === true", store)
+        self.assertIn("job.showInGallery === true", gallery)
+
+    def test_studio_queue_release_preserves_submission_order(self):
+        started_threads = []
+        saved_jobs = []
+
+        class FakeThread:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+                started_threads.append(self)
+
+            def start(self):
+                self.started = True
+
+        jobs = {
+            "later": {"status": "held", "created_at": 20},
+            "active": {"status": "running", "created_at": 5},
+            "earlier": {"status": "held", "created_at": 10},
+        }
+
+        def release(job, **updates):
+            if job.get("status") != "held":
+                return False
+            job.update(updates)
+            job["status"] = "queued"
+            return True
+
+        start_queue = _load_isolated_function(
+            "app/launch.py",
+            "_start_held_studio_queue",
+            {
+                "_jobs": jobs,
+                "snapshot_job": lambda job: dict(job),
+                "release_held": release,
+                "threading": SimpleNamespace(Thread=FakeThread),
+                "_run_held_studio_jobs": object(),
+                "_studio_job_archive": SimpleNamespace(save=lambda job: saved_jobs.append(dict(job))),
+            },
+        )
+
+        self.assertEqual(start_queue(), ["earlier", "later"])
+        self.assertEqual([job["created_at"] for job in saved_jobs], [10, 20])
+        self.assertTrue(all(job["status"] == "queued" for job in saved_jobs))
+        self.assertEqual(jobs["earlier"]["status"], "queued")
+        self.assertEqual(jobs["later"]["status"], "queued")
+        self.assertEqual(jobs["active"]["status"], "running")
+        self.assertEqual(len(started_threads), 1)
+        self.assertEqual(
+            started_threads[0].kwargs["args"],
+            (["earlier", "later"],),
+        )
+        self.assertTrue(started_threads[0].started)
+
+    def test_director_music_progress_validation_imports_regex_module(self):
+        imported_modules = {
+            alias.asname or alias.name.split(".", 1)[0]
+            for node in self.launch.body
+            if isinstance(node, ast.Import)
+            for alias in node.names
+        }
+        generate_music = _function(self.launch, "director_generate_music")
+        uses_re_fullmatch = any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "fullmatch"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "re"
+            for node in ast.walk(generate_music)
+        )
+
+        self.assertTrue(uses_re_fullmatch)
+        self.assertIn("re", imported_modules)
+
+    def test_director_dashboard_mutations_run_off_the_event_loop(self):
+        expected = {
+            "rerun_pipeline_clip_image": "rerun_clip_image",
+            "rerun_pipeline_clip_video": "rerun_clip_video",
+            "rejoin_pipeline_clips": "rejoin_clips",
+        }
+        for endpoint_name, worker_name in expected.items():
+            with self.subTest(endpoint=endpoint_name):
+                endpoint = _function(self.launch, endpoint_name)
+                awaited_thread_targets = {
+                    call.args[0].id
+                    for node in ast.walk(endpoint)
+                    if isinstance(node, ast.Await)
+                    and isinstance(node.value, ast.Call)
+                    and isinstance(node.value.func, ast.Attribute)
+                    and node.value.func.attr == "to_thread"
+                    for call in [node.value]
+                    if call.args and isinstance(call.args[0], ast.Name)
+                }
+                self.assertIn(worker_name, awaited_thread_targets)
+
+    def test_director_bulk_repair_routes_to_server_owned_worker(self):
+        repair = _function(self.launch, "repair_saved_pipeline")
+        cancel = _function(self.launch, "cancel_saved_pipeline_repair")
+        self.assertIn("start_pipeline_repair", _called_names(repair))
+        self.assertIn("cancel_pipeline_repair", _called_names(cancel))
+
+    def test_director_prompt_save_validates_json_object_before_service_call(self):
+        endpoint = _function(self.launch, "save_pipeline_clip_prompt")
+        source = ast.unparse(endpoint)
+        self.assertIn("body = await request.json()", source)
+        self.assertIn("not isinstance(body, dict)", source)
+        self.assertGreaterEqual(source.count("status_code=400"), 2)
+        self.assertIn("update_clip_prompt", _called_names(endpoint))
+
+    def test_blend_defers_generation_completion(self):
+        blend = _function(self.launch, "_run_blend_generation")
+        matching_calls = [
+            node for node in ast.walk(blend)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_run_generation"
+        ]
+        self.assertEqual(len(matching_calls), 1)
+        finalize = next(
+            (kw.value for kw in matching_calls[0].keywords if kw.arg == "finalize"),
+            None,
+        )
+        self.assertIsInstance(finalize, ast.Constant)
+        self.assertIs(finalize.value, False)
+
+    def test_wan_checks_abort_before_resetting_interrupt(self):
+        wgp = _parse("app/wgp.py")
+        generate = _function(wgp, "generate_video")
+        self.assertIn(
+            "_cleanup_generation_resources",
+            {
+                node.name for node in generate.body
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            },
+        )
+        with open(
+            os.path.join(_ROOT, "app", "wgp.py"), "r", encoding="utf-8",
+        ) as handle:
+            source_lines = handle.read().splitlines()
+        body = "\n".join(source_lines[generate.lineno - 1:generate.end_lineno])
+        reset = body.index("wan_model._interrupt = False")
+        before = body.rfind('if gen.get("abort", False):', 0, reset)
+        after = body.find('if gen.get("abort", False):', reset)
+        self.assertGreaterEqual(before, 0)
+        self.assertGreater(after, reset)
+        for check in (before, after):
+            cleanup = body.find("_cleanup_generation_resources()", check)
+            abort_return = body.find("return False", check)
+            self.assertLess(check, cleanup)
+            self.assertLess(cleanup, abort_return)
+
+    def test_flashvsr_checks_cancel_before_replacing_source_video(self):
+        upscale = _function(
+            self.launch, "_apply_spatial_upsampling_to_file",
+        )
+        with open(
+            os.path.join(_ROOT, "app", "launch.py"),
+            "r", encoding="utf-8",
+        ) as handle:
+            launch_source = handle.read()
+        source = ast.get_source_segment(launch_source, upscale)
+        self.assertIsNotNone(source)
+        for replacement in (
+            "os.replace(tmp_muxed, video_path)",
+            "os.replace(tmp_video, video_path)",
+        ):
+            replace_at = source.index(replacement)
+            check_at = source.rfind("abort_check()", 0, replace_at)
+            self.assertGreaterEqual(check_at, 0)
+
+    def test_generation_stamps_partial_outputs_before_cancel_return(self):
+        generation = _function(self.launch, "_run_generation")
+        with open(
+            os.path.join(_ROOT, "app", "launch.py"), "r", encoding="utf-8",
+        ) as handle:
+            launch_source = handle.read()
+        source = ast.get_source_segment(launch_source, generation)
+        self.assertIsNotNone(source)
+        publish_at = source.index("record_job_outputs(\n                    job,")
+        stamp_at = source.index("_write_output_sidecars(new_files)", publish_at)
+        cancel_at = source.index("if cancelled or is_cancel_requested(job):", stamp_at)
+        cancel_return = source.index("return False", cancel_at)
+        self.assertLess(publish_at, stamp_at)
+        self.assertLess(stamp_at, cancel_at)
+        self.assertLess(cancel_at, cancel_return)
+
+    def test_director_sidecars_cover_every_supported_media_extension(self):
+        generation = _function(self.launch, "_run_generation")
+        sidecar_writer = next(
+            node for node in ast.walk(generation)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_write_output_sidecars"
+        )
+        referenced_names = {
+            node.id for node in ast.walk(sidecar_writer)
+            if isinstance(node, ast.Name)
+        }
+        self.assertIn("GENERATED_MEDIA_EXTENSIONS", referenced_names)
+        self.assertIn("output_filename", {
+            node.value for node in ast.walk(sidecar_writer)
+            if isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+        })
+
+    def test_gallery_sidecars_use_active_generation_time(self):
+        generation = _function(self.launch, "_run_generation")
+        with open(
+            os.path.join(_ROOT, "app", "launch.py"), "r", encoding="utf-8",
+        ) as handle:
+            launch_source = handle.read()
+        source = ast.get_source_segment(launch_source, generation)
+        self.assertIsNotNone(source)
+        self.assertIn('cmd == "generation_time"', source)
+        self.assertIn("active_generation_seconds_by_output", source)
+        self.assertIn("multi_window_timing_by_output", source)
+        self.assertIn('"window_generation_seconds"', source)
+        self.assertIn('"scene_duration_seconds"', source)
+        self.assertIn('"job_elapsed_time":', source)
+        self.assertNotIn(
+            '"generation_time": round(time.time() - start_time)',
+            source,
+        )
+
+        generate_video = _function(_parse("app/wgp.py"), "generate_video")
+        with open(
+            os.path.join(_ROOT, "app", "wgp.py"), "r", encoding="utf-8",
+        ) as handle:
+            wgp_source = handle.read()
+        wgp_body = ast.get_source_segment(wgp_source, generate_video)
+        self.assertIsNotNone(wgp_body)
+        self.assertIn('"generation_time",', wgp_body)
+        self.assertIn('"window_seconds": window_elapsed_seconds', wgp_body)
+        self.assertIn('"total_windows":', wgp_body)
+        self.assertIn('configs["generation_time_basis"] = "active"', wgp_body)
+
+    def test_generation_duration_is_minutes_and_seconds(self):
+        formatter = _load_isolated_function(
+            "app/wgp.py",
+            "format_generation_time",
+            {},
+        )
+        self.assertEqual(formatter(128), "2m 8s")
+        self.assertEqual(formatter(8), "0m 8s")
+        self.assertEqual(formatter(3601), "60m 1s")
+
+    def test_continuation_accepts_all_generated_video_containers(self):
+        generation = _function(self.launch, "_run_generation")
+        with open(
+            os.path.join(_ROOT, "app", "launch.py"), "r", encoding="utf-8",
+        ) as handle:
+            launch_source = handle.read()
+        source = ast.get_source_segment(launch_source, generation)
+        continuation = source.split(
+            "# Find the latest video explicitly registered by", 1,
+        )[1].split("if latest_video:", 1)[0]
+        for extension in (".mp4", ".webm", ".mkv", ".mov"):
+            self.assertIn(extension, continuation)
+
+    def test_failed_multiclip_concat_removes_partial_output(self):
+        concatenate = _load_isolated_function(
+            "app/wgp.py",
+            "concatenate_multi_clip_videos",
+            {"os": os},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            clip = os.path.join(directory, "clip.mp4")
+            output = os.path.join(directory, "joined.mp4")
+            with open(clip, "wb") as handle:
+                handle.write(b"clip")
+
+            def fake_run(command, **kwargs):
+                if "-filter_complex" in command:
+                    with open(output, "wb") as handle:
+                        handle.write(b"partial")
+                    return SimpleNamespace(
+                        returncode=1, stdout="", stderr="ffmpeg error",
+                    )
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with patch("subprocess.run", side_effect=fake_run):
+                self.assertFalse(concatenate([clip], output))
+            self.assertFalse(os.path.exists(output))
+
+    def test_multiclip_external_audio_can_start_after_source_time_zero(self):
+        concatenate = _load_isolated_function(
+            "app/wgp.py",
+            "concatenate_multi_clip_videos",
+            {"os": os},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            clip = os.path.join(directory, "clip.mp4")
+            audio = os.path.join(directory, "song.wav")
+            output = os.path.join(directory, "joined.mp4")
+            for path in (clip, audio):
+                with open(path, "wb") as handle:
+                    handle.write(b"media")
+            commands = []
+
+            def fake_run(command, **kwargs):
+                commands.append(command)
+                if "-filter_complex" in command:
+                    with open(output, "wb") as handle:
+                        handle.write(b"joined")
+                stdout = "25/1\n" if "stream=r_frame_rate" in command else ""
+                return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+
+            with patch("subprocess.run", side_effect=fake_run):
+                self.assertTrue(concatenate(
+                    [clip], output, audio, audio_start_sec=2.0,
+                ))
+
+            command = next(c for c in commands if "-filter_complex" in c)
+            filter_value = command[command.index("-filter_complex") + 1]
+            self.assertIn(
+                "[1:a]atrim=start=2.000000,asetpts=PTS-STARTPTS[outa]",
+                filter_value,
+            )
+            self.assertIn("[outa]", command)
+
+    def test_multiclip_concat_can_be_cancelled_during_ffmpeg(self):
+        concatenate = _load_isolated_function(
+            "app/wgp.py",
+            "concatenate_multi_clip_videos",
+            {"os": os},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            clip = os.path.join(directory, "clip.mp4")
+            output = os.path.join(directory, "joined.mp4")
+            with open(clip, "wb") as handle:
+                handle.write(b"clip")
+
+            class FakeProcess:
+                def __init__(self, *_args, **_kwargs):
+                    self.returncode = None
+                    self.finished = False
+                    with open(output, "wb") as handle:
+                        handle.write(b"partial")
+
+                def communicate(self, timeout=None):
+                    if not self.finished:
+                        raise subprocess.TimeoutExpired("ffmpeg", timeout)
+                    return "", ""
+
+                def terminate(self):
+                    self.finished = True
+                    self.returncode = -15
+
+                def kill(self):
+                    self.finished = True
+                    self.returncode = -9
+
+                def poll(self):
+                    return self.returncode
+
+            probe = SimpleNamespace(returncode=0, stdout="", stderr="")
+            with patch("subprocess.run", return_value=probe):
+                with patch("subprocess.Popen", FakeProcess):
+                    self.assertFalse(concatenate(
+                        [clip],
+                        output,
+                        abort_callback=lambda: True,
+                    ))
+            self.assertFalse(os.path.exists(output))
+
+    def test_multiclip_can_pad_short_audio_to_exact_video_timeline(self):
+        concatenate = _load_isolated_function(
+            "app/wgp.py",
+            "concatenate_multi_clip_videos",
+            {"os": os},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            clip = os.path.join(directory, "clip.mp4")
+            audio = os.path.join(directory, "source.mp4")
+            output = os.path.join(directory, "joined.mp4")
+            for path in (clip, audio):
+                with open(path, "wb") as handle:
+                    handle.write(b"media")
+            commands = []
+
+            def fake_run(command, **kwargs):
+                commands.append(command)
+                if "-filter_complex" in command:
+                    with open(output, "wb") as handle:
+                        handle.write(b"joined")
+                stdout = "30/1\n" if "stream=r_frame_rate" in command else ""
+                return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+
+            with patch("subprocess.run", side_effect=fake_run):
+                self.assertTrue(concatenate(
+                    [clip],
+                    output,
+                    audio,
+                    pad_audio=True,
+                    audio_duration_sec=1.25,
+                ))
+
+            command = next(c for c in commands if "-filter_complex" in c)
+            filter_value = command[command.index("-filter_complex") + 1]
+            self.assertIn(
+                "[1:a]asetpts=PTS-STARTPTS,apad,"
+                "atrim=duration=1.250000[outa]",
+                filter_value,
+            )
+            self.assertIn("[outa]", command)
+            self.assertIn("-shortest", command)
+
+    def test_multiclip_dispatch_preserves_audio_origin(self):
+        generation = _function(self.launch, "_run_generation")
+        with open(
+            os.path.join(_ROOT, "app", "launch.py"), "r", encoding="utf-8",
+        ) as handle:
+            source = ast.get_source_segment(handle.read(), generation)
+        self.assertIn('raw_params.get("audio_frame_offset", 0)', source)
+        self.assertGreaterEqual(source.count(
+            '"audio_start_sec": multi_clip_audio_start_sec'
+        ), 2)
+
+    def test_director_multiclip_dispatch_uses_explicit_prompt_modes(self):
+        generation = _function(self.launch, "_run_generation")
+        with open(
+            os.path.join(_ROOT, "app", "launch.py"), "r", encoding="utf-8",
+        ) as handle:
+            source = ast.get_source_segment(handle.read(), generation)
+        self.assertIn('raw_params.pop(\n                    "per_clip_prompt_modes"', source)
+        self.assertIn("explicit_prompt_mode", source)
+        self.assertIn(
+            'else (1 if "\\n" in clip_prompt else 0)',
+            source,
+        )
+
+    def test_failed_audio_mux_removes_partial_output(self):
+        combine = _load_isolated_function(
+            "app/shared/utils/audio_video.py",
+            "combine_and_concatenate_video_with_audio_tracks",
+            {
+                "os": os,
+                "subprocess": subprocess,
+                "get_mp4_audio_codec_settings": lambda _key: {
+                    "codec": "aac", "bitrate": None,
+                },
+            },
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            output = os.path.join(directory, "muxed.mp4")
+
+            def fail_after_partial(command, **kwargs):
+                with open(output, "wb") as handle:
+                    handle.write(b"partial")
+                raise subprocess.CalledProcessError(
+                    1, command, stderr="mux failed",
+                )
+
+            with patch("subprocess.run", side_effect=fail_after_partial):
+                with self.assertRaisesRegex(Exception, "FFmpeg error"):
+                    combine(
+                        output, "input.mp4", [], [], 0, 44100,
+                    )
+            self.assertFalse(os.path.exists(output))
+
+    def test_wgp_audio_mux_always_cleans_raw_render_temp(self):
+        generate = _function(_parse("app/wgp.py"), "generate_video")
+
+        def calls_named(node, name):
+            return any(
+                isinstance(child, ast.Call)
+                and (
+                    isinstance(child.func, ast.Name)
+                    and child.func.id == name
+                    or isinstance(child.func, ast.Attribute)
+                    and child.func.attr == name
+                )
+                for child in ast.walk(node)
+            )
+
+        cleanup_try = next(
+            (
+                node for node in ast.walk(generate)
+                if isinstance(node, ast.Try)
+                and calls_named(ast.Module(body=node.body, type_ignores=[]),
+                                "combine_and_concatenate_video_with_audio_tracks")
+                and calls_named(ast.Module(body=node.finalbody, type_ignores=[]),
+                                "remove")
+            ),
+            None,
+        )
+        self.assertIsNotNone(cleanup_try)
+        self.assertTrue(any(
+            isinstance(child, ast.Name) and child.id == "save_path_tmp"
+            for statement in cleanup_try.finalbody
+            for child in ast.walk(statement)
+        ))
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

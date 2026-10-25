@@ -1,0 +1,396 @@
+import { useEffect, useState } from 'react'
+import { Plus, X } from 'lucide-react'
+import { useStore } from '../../stores/useStore'
+import { ChoiceControl } from '../shared/ChoiceControl'
+import { FileUploadZone } from '../shared/FileUploadZone'
+import { GalleryInput } from '../shared/GalleryInput'
+import * as api from '../../api/client'
+import type { SavedOmniCharacter } from '../../types'
+import { ttsVoiceLimit } from '../../lib/ttsVoices'
+import { characterDisplayName } from '../../lib/characters'
+import { TtsCharacterLibrary } from './TtsCharacterLibrary'
+
+export function AudioModeSection() {
+  const modelOptions = useStore(s => s.modelOptions)
+  const params = useStore(s => s.params)
+  const setParam = useStore(s => s.setParam)
+  const audioGuideFilename = useStore(s => s.audioGuideFilename)
+  const setAudioGuideFilename = useStore(s => s.setAudioGuideFilename)
+  const [videoGuideFilename, setVideoGuideFilename] = useState<string | null>(null)
+  const [uploading, setUploading] = useState(false)
+  const [error, setError] = useState('')
+  const [characters, setCharacters] = useState<SavedOmniCharacter[]>([])
+  const [pendingCharacter, setPendingCharacter] = useState<SavedOmniCharacter | null>(null)
+  const modelOptionsLoading = useStore(s => s.modelOptionsLoading)
+  const selectModel = useStore(s => s.selectModel)
+
+  // Dynamic multi-voice state
+  const ttsVoiceCount = useStore(s => s.ttsVoiceCount)
+  const ttsVoices = useStore(s => s.ttsVoices)
+  const addTtsVoice = useStore(s => s.addTtsVoice)
+  const removeTtsVoice = useStore(s => s.removeTtsVoice)
+  const setTtsVoiceName = useStore(s => s.setTtsVoiceName)
+  const setTtsVoiceFile = useStore(s => s.setTtsVoiceFile)
+  const setTtsVoiceCharacter = useStore(s => s.setTtsVoiceCharacter)
+  const setTtsVoiceCount = useStore(s => s.setTtsVoiceCount)
+  const setDurationSeconds = useStore(s => s.setDurationSeconds)
+
+  useEffect(() => {
+    if (!pendingCharacter || modelOptionsLoading) return
+    if (params.model_type === 'qwen3_tts_base' && modelOptions?.architecture === 'qwen3_tts_base') {
+      setTtsVoiceCharacter(0, pendingCharacter)
+    } else if (params.model_type === 'qwen3_tts_base') {
+      setError('Could not load Qwen3 Voice Cloning. Select that model and try again.')
+    }
+    setPendingCharacter(null)
+  }, [pendingCharacter, modelOptionsLoading, modelOptions?.architecture, params.model_type, setTtsVoiceCharacter])
+
+  if (!modelOptions || (!modelOptions.audio_prompt_type_sources && !modelOptions.audio_only)) return null
+
+  const isAudioOnly = modelOptions.audio_only
+  const config = modelOptions.audio_prompt_type_sources
+  const audioValue = (params.audio_prompt_type ?? config?.default ?? '') as string
+  const audioBaseMode = audioValue.replace(/[NV]/g, '')
+  const needsAudioUpload = audioBaseMode.includes('A') && !isAudioOnly
+  const needsVideoGuideUpload = audioValue === 'K' && !modelOptions.guide_preprocessing
+  const restoredVideoGuideFilename = videoGuideFilename || (
+    typeof params.video_guide === 'string' && params.video_guide
+      ? params.video_guide.replace(/\\/g, '/').split('/').pop() || null
+      : null
+  )
+  // Models that derive audio_prompt_type purely from the voice-clone slot count
+  // (e.g. KugelAudio: 0→"", 1→"A", 2+→"AB") opt out of the manual ChoiceControl
+  // by setting `audio_mode_from_voice_count: true` in their model_def. The Add
+  // Voice / Remove Voice buttons are the only mode-selection UI for those
+  // models, eliminating the dual-source-of-truth confusion that Phase 6's
+  // ChoiceControl unhide (commit 19eda0b) introduced.
+  const hideAudioModeChoice = Boolean((modelOptions as { audio_mode_from_voice_count?: boolean }).audio_mode_from_voice_count)
+  // Show only voice slots that the selected model consumes.
+  const maxVoiceCount = ttsVoiceLimit(modelOptions)
+  const switchToClone = ['qwen3_tts_customvoice', 'qwen3_tts_voicedesign'].includes(modelOptions.architecture)
+  const emptySlot = ttsVoices.slice(0, ttsVoiceCount).findIndex(voice => !voice.path)
+  const canAddCharacter = switchToClone || emptySlot >= 0 || ttsVoiceCount < maxVoiceCount
+
+  const chooseCharacter = (character: SavedOmniCharacter, index?: number) => {
+    setError('')
+    if (switchToClone) {
+      setPendingCharacter(character)
+      // Voice-design instructions and preset speaker IDs are not reference
+      // transcripts or language IDs in Qwen's Base voice-cloning variant.
+      setParam('alt_prompt', '')
+      selectModel('qwen3_tts_base')
+      return
+    }
+    try {
+      setTtsVoiceCharacter(index ?? (emptySlot >= 0 ? emptySlot : ttsVoiceCount), character)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not use this character.')
+    }
+  }
+
+  const getAudioDuration = (file: File): Promise<number | null> => {
+    // Use HTML5 <video> element for video files and <audio> for audio.
+    // <video> can decode pure-audio formats too (since it's a superset
+    // of <audio> capability in practice), so we could use <video>
+    // unconditionally — but Audio is lighter and works for the common
+    // audio-file path, so we branch on MIME / extension.
+    const isVideo = file.type.startsWith('video/') ||
+      /\.(mp4|mov|mkv|webm|avi|m4v)$/i.test(file.name)
+    return new Promise(resolve => {
+      const url = URL.createObjectURL(file)
+      const el: HTMLMediaElement = isVideo
+        ? document.createElement('video')
+        : new Audio()
+      el.addEventListener('loadedmetadata', () => {
+        const dur = el.duration
+        URL.revokeObjectURL(url)
+        resolve(Number.isFinite(dur) ? dur : null)
+      })
+      el.addEventListener('error', () => { URL.revokeObjectURL(url); resolve(null) })
+      el.src = url
+    })
+  }
+
+  const handleLegacyUpload = async (file: File, paramKey: 'audio_guide' | 'audio_guide2' | 'video_guide', setFilename: (n: string | null) => void) => {
+    setUploading(true)
+    try {
+      // Route audio_guide uploads through /api/v1/upload-audio, which
+      // accepts both audio AND video files (extracting the audio track
+      // for the latter). This lets the user drop a music video onto the
+      // soundtrack slot without converting to mp3 first.
+      // video_guide uploads (control video, used as a motion reference)
+      // keep using the generic /api/v1/upload because the FULL video is
+      // the input — extracting audio would defeat the purpose.
+      const isAudioGuide = paramKey === 'audio_guide' || paramKey === 'audio_guide2'
+      const result = isAudioGuide
+        ? await api.uploadAudio(file)
+        : await api.uploadImage(file)
+      setParam(paramKey as keyof import('../../types').GenerateParams, result.path)
+      // For video-uploaded-as-audio_guide, the file the backend stored is
+      // an extracted WAV with a generated name. Show the original filename
+      // in the UI so the user recognizes their upload, but the backing
+      // path points to the extracted WAV.
+      setFilename(file.name)
+      if (paramKey === 'audio_guide' && !isAudioOnly) {
+        const dur = await getAudioDuration(file)
+        if (dur && dur > 0) setDurationSeconds(Math.round(dur * 10) / 10)
+      }
+    } catch (e) {
+      console.error('Upload failed:', e)
+      return false
+    } finally {
+      setUploading(false)
+    }
+  }
+
+  const handleVoiceUpload = async (file: File, index: number) => {
+    setUploading(true)
+    setError('')
+    const uploadModel = params.model_type
+    try {
+      const result = await api.uploadAudio(file)
+      if (useStore.getState().params.model_type !== uploadModel) return
+      setTtsVoiceFile(index, file.name, result.path)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Voice upload failed.')
+    } finally {
+      setUploading(false)
+    }
+  }
+
+  const clearVoice = (index: number) => {
+    setTtsVoiceFile(index, null, null)
+  }
+
+  return (
+    <div className="space-y-3">
+      {isAudioOnly && <TtsCharacterLibrary
+        onSelect={chooseCharacter} onCharactersChange={setCharacters}
+        selectedIds={ttsVoices.slice(0, ttsVoiceCount).flatMap(voice => voice.characterId ? [voice.characterId] : [])}
+        canAdd={canAddCharacter} disabled={uploading || modelOptionsLoading} switchToClone={switchToClone}
+      />}
+      {!isAudioOnly && needsAudioUpload && <GalleryInput kind="audio" label="audio prompt source"
+        onFile={file => handleLegacyUpload(file, 'audio_guide', setAudioGuideFilename)}
+        disabledReason={uploading ? 'Uploading audio…' : undefined} />}
+      {isAudioOnly && maxVoiceCount > 0 && ttsVoiceCount > 0 && ttsVoices.slice(0, ttsVoiceCount).map((_, index) => (
+        <GalleryInput key={`voice-${index}`} kind="audio"
+          label={modelOptions.architecture === 'index_tts2' && audioBaseMode === 'AB' && index === 1
+            ? 'emotion reference' : `voice ${index + 1} reference`}
+          onFile={file => handleVoiceUpload(file, index)}
+          disabledReason={uploading ? 'Uploading a voice reference…' : modelOptionsLoading ? 'Model options are loading.' : undefined} />
+      ))}
+      {error && <p role="alert" className="text-[10px] text-indicator-error">{error}</p>}
+      {/* Audio mode selector — shown for any model that exposes audio_prompt_type_sources
+          UNLESS the model opted into voice-count-driven mode (KugelAudio). For those,
+          the voice-slot buttons below are the only mode UI to eliminate dual-source-
+          of-truth drift. Previously gated on !isAudioOnly (Phase 6 commit 19eda0b
+          removed that to let Scenema/Index TTS2 show their explicit text/single-ref/
+          two-ref choices). */}
+      {config && !hideAudioModeChoice && (
+        <ChoiceControl
+          config={config}
+          value={audioBaseMode}
+          onChange={val => {
+            const flags = audioValue.replace(/[^NV]/g, '')
+            if (isAudioOnly) setTtsVoiceCount(val.includes('B') ? 2 : val.includes('A') ? 1 : 0)
+            setParam('audio_prompt_type', val + flags)
+            if (!val.includes('A')) {
+              setParam('audio_guide', undefined)
+              setAudioGuideFilename(null)
+            }
+            if (val !== 'K') {
+              setParam('video_guide', undefined)
+              setVideoGuideFilename(null)
+            }
+            const isAudioDriven = val.includes('A') && !isAudioOnly
+            setParam('modality_scale' as keyof import('../../types').GenerateParams, isAudioDriven ? 1.0 : 1.0)
+          }}
+          label="Audio Mode"
+        />
+      )}
+
+      {/* TTS Voice Cloning — dynamic 1-6 voices */}
+      {isAudioOnly && maxVoiceCount > 0 && (
+        <fieldset disabled={uploading || modelOptionsLoading} className="space-y-2 disabled:opacity-50">
+          {/* Add Voice button — always at top */}
+          {ttsVoiceCount < maxVoiceCount && (
+            <button
+              onClick={addTtsVoice}
+              className="w-full py-1.5 rounded-lg text-[10px] font-medium border border-dashed border-border text-text-muted hover:text-text-primary hover:border-border-light transition-colors flex items-center justify-center gap-1.5"
+            >
+              <Plus size={12} />
+              {ttsVoiceCount === 0 ? 'Add Voice Clone' : `Add Voice (${ttsVoiceCount}/${maxVoiceCount})`}
+            </button>
+          )}
+
+          {ttsVoiceCount === 0 && (
+            <p className="text-[9px] text-text-muted text-center">
+              {config?.selection?.includes('') || !config
+                ? 'Text-only mode. Add voices to clone specific speakers.'
+                : 'Add a saved character or upload a voice reference to begin.'}
+            </p>
+          )}
+
+          {/* Voice zones grid — 2 columns */}
+          {ttsVoiceCount > 0 && (
+            <div className="grid grid-cols-2 gap-2">
+              {ttsVoices.slice(0, ttsVoiceCount).map((voice, i) => (
+                <div key={i} className="bg-bg-tertiary/50 border border-border rounded-lg p-2 relative">
+                  <button
+                    aria-label={`Remove voice ${i + 1}`}
+                    onClick={() => removeTtsVoice(i)}
+                    className="absolute -top-1.5 -right-1.5 p-0.5 rounded-full bg-bg-secondary border border-border text-text-muted hover:text-red-400 hover:border-red-400/50 transition-colors z-10"
+                  >
+                    <X size={10} />
+                  </button>
+                  <label className="text-[9px] text-text-muted uppercase tracking-wider block mb-1">
+                    {modelOptions.architecture === 'index_tts2' && audioBaseMode === 'AB' && i === 1 ? 'Emotion reference' : `Voice ${i + 1}`}
+                  </label>
+                  <select aria-label={`Saved character for voice ${i + 1}`} value={voice.characterId || ''}
+                    onChange={event => {
+                      const character = characters.find(item => item.id === event.target.value)
+                      if (character) chooseCharacter(character, i)
+                      else clearVoice(i)
+                    }}
+                    className="w-full mb-1.5 rounded border border-border bg-bg-tertiary px-1 py-1 text-[10px] text-text-primary">
+                    <option value="">Choose saved character…</option>
+                    {voice.characterId && !characters.some(item => item.id === voice.characterId) && <option value={voice.characterId}>{characterDisplayName(voice.characterName || voice.name)}</option>}
+                    {characters.map(character => <option key={character.id} value={character.id} disabled={!character.voice?.path}>{characterDisplayName(character.name)}{!character.voice ? ' (no voice)' : ''}</option>)}
+                  </select>
+                  <FileUploadZone
+                    label={uploading ? '...' : 'Drop voice audio or video'}
+                    accept=".wav,.mp3,.flac,.ogg,.m4a,.aac,.mp4,.mov,.mkv,.webm"
+                    filename={voice.filename}
+                    onFile={f => handleVoiceUpload(f, i)}
+                    onClear={() => clearVoice(i)}
+                  />
+                  <input
+                    type="text"
+                    aria-label={`Speaker name for voice ${i + 1}`}
+                    placeholder="Speaker name"
+                    value={voice.name}
+                    onChange={e => setTtsVoiceName(i, e.target.value)}
+                    className="w-full mt-1 bg-bg-tertiary border border-border rounded px-1.5 py-0.5 text-[9px] text-text-primary placeholder:text-text-muted focus:outline-none focus:border-accent-blue"
+                  />
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Audio processing toggles — show when any voices are active */}
+          {ttsVoiceCount > 0 && (
+            <div className="space-y-1.5 pt-1">
+              {ttsVoiceCount >= 2 && (
+                <p className="text-[9px] text-text-muted">
+                  Use these names or Speaker 1 / Speaker 2 in your script. Saved character names stay bound to their voices.
+                </p>
+              )}
+              <label className="flex items-center gap-2 cursor-pointer group">
+                <input type="checkbox"
+                  checked={audioValue.includes('N')}
+                  onChange={e => {
+                    const current = (params.audio_prompt_type || '') as string
+                    setParam('audio_prompt_type', e.target.checked ? current + 'N' : current.replace('N', ''))
+                  }}
+                  className="accent-accent-blue" />
+                <span className="text-[10px] text-text-secondary group-hover:text-text-primary transition-colors">
+                  Normalize audio volumes
+                </span>
+              </label>
+              <label className="flex items-center gap-2 cursor-pointer group">
+                <input type="checkbox"
+                  checked={audioValue.includes('V')}
+                  onChange={e => {
+                    const current = (params.audio_prompt_type || '') as string
+                    setParam('audio_prompt_type', e.target.checked ? current + 'V' : current.replace('V', ''))
+                  }}
+                  className="accent-accent-blue" />
+                <span className="text-[10px] text-text-secondary group-hover:text-text-primary transition-colors">
+                  Remove background music
+                </span>
+              </label>
+              {ttsVoiceCount >= 2 && (
+                <label className="flex items-center gap-2 cursor-pointer group">
+                  <input type="checkbox"
+                    checked={!!(params as unknown as Record<string, unknown>).tts_dynaudnorm}
+                    onChange={e => setParam('tts_dynaudnorm' as keyof import('../../types').GenerateParams, e.target.checked ? 1 : undefined)}
+                    className="accent-accent-blue" />
+                  <span className="text-[10px] text-text-secondary group-hover:text-text-primary transition-colors">
+                    Smooth speaker volumes
+                  </span>
+                </label>
+              )}
+            </div>
+          )}
+        </fieldset>
+      )}
+
+      {/* Non-TTS: Audio file upload (LTX soundtrack mode).
+          Accepts both audio files AND video files — backend extracts
+          the audio track from video via ffmpeg before storing as WAV. */}
+      {!isAudioOnly && needsAudioUpload && (
+        <div>
+          <label className="text-[11px] text-text-muted uppercase tracking-wider mb-1.5 block">
+            Audio File
+          </label>
+          <FileUploadZone
+            label={uploading ? 'Uploading...' : 'Drop audio or video (audio will be extracted)'}
+            accept=".wav,.mp3,.flac,.ogg,.m4a,.mp4,.mov,.mkv,.webm,.avi,.m4v"
+            filename={audioGuideFilename}
+            onFile={file => handleLegacyUpload(file, 'audio_guide', setAudioGuideFilename)}
+            onClear={() => {
+              setParam('audio_guide', undefined)
+              setAudioGuideFilename(null)
+            }}
+          />
+        </div>
+      )}
+
+      {/* Non-TTS: Audio strength slider (when audio file is uploaded) */}
+      {!isAudioOnly && needsAudioUpload && audioGuideFilename && (
+        <div>
+          <div className="flex items-center justify-between mb-1">
+            <label className="text-[10px] text-text-muted uppercase tracking-wider">
+              {modelOptions?.audio_scale_name || 'Prompt Audio Strength'}
+            </label>
+            <span className="text-[10px] text-text-secondary">
+              {((params as unknown as Record<string, unknown>).modality_scale as number ?? 1.0).toFixed(1)}
+            </span>
+          </div>
+          <input
+            type="range" min={0.1} max={3.0} step={0.1}
+            value={(params as unknown as Record<string, unknown>).modality_scale as number ?? 1.0}
+            onChange={e => setParam('modality_scale' as keyof import('../../types').GenerateParams, parseFloat(e.target.value))}
+            className="w-full accent-accent-blue"
+          />
+          <div className="flex justify-between text-[9px] text-text-muted mt-0.5">
+            <span>0.1</span><span>1.0 (Default)</span><span>3.0 (Experimental TTS Boost)</span>
+          </div>
+        </div>
+      )}
+
+      {/* Non-TTS: Video guide upload (control video for soundtrack) */}
+      {!isAudioOnly && needsVideoGuideUpload && (
+        <div>
+          <GalleryInput kind="video" label="control video"
+            onFile={file => handleLegacyUpload(file, 'video_guide', setVideoGuideFilename)}
+            disabledReason={uploading ? 'Uploading control media…' : undefined} />
+          <label className="text-[11px] text-text-muted uppercase tracking-wider mb-1.5 block">
+            Control Video
+          </label>
+          <FileUploadZone
+            label={uploading ? 'Uploading...' : 'Drop video file (.mp4)'}
+            accept=".mp4,.webm,.mkv"
+            filename={restoredVideoGuideFilename}
+            videoUrl={restoredVideoGuideFilename ? api.getFileUrl(restoredVideoGuideFilename) : undefined}
+            onFile={file => handleLegacyUpload(file, 'video_guide', setVideoGuideFilename)}
+            onClear={() => {
+              setParam('video_guide', undefined)
+              setVideoGuideFilename(null)
+            }}
+          />
+        </div>
+      )}
+    </div>
+  )
+}

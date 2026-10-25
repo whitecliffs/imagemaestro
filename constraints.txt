@@ -1,0 +1,6 @@
+# Keep the selected accelerator build; never replace it during dependency resolution.
+torch==2.9.1
+torchvision==0.24.1
+torchaudio==2.9.1
+# The backend uses the Gradio 5 API.
+gradio>=5.0,<6

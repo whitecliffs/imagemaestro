@@ -1,0 +1,1452 @@
+"""Intent, native reference binding, and prose survive unified enhancement."""
+from copy import deepcopy
+from pathlib import Path
+import sys
+import unittest
+import json
+from unittest.mock import Mock, patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'app'))
+from services.adaptive_enhancement import adaptive_dialogue_expected, adaptive_writing_guide, draft_spoken_exchange
+from services.dialogue_writing import dialogue_forbidden, spoken_word_count
+from services.h3_story_ledger import _canonicalize_story_ledger, _deterministic_ledger, extract_source_events, extract_h3_source_intent
+from services import llm_service
+from services.llm_sampling import caller_sampling_enabled
+
+
+CONCEPT = 'dynamic kung fu fight scene set in the mountains with power hits and cinematic action'
+
+
+class AdaptiveWritingTests(unittest.TestCase):
+    def test_overlong_valid_exchange_is_copyedited_without_changing_speakers_or_order(self):
+        prompt = (
+            "Nora, Kai, and Mina have an exactly three-turn conversation about a difficult holiday launch, "
+            "ending with Nora inviting the team back next year."
+        )
+        draft = [
+            {"speaker": "Kai", "text": "We nearly missed launch, but everyone kept moving when the schedule slipped badly twice."},
+            {"speaker": "Mina", "text": "I fixed the payment bug after Nora spotted how our holiday orders doubled overnight."},
+            {"speaker": "Nora", "text": "I want everyone back next year; let's make our launch easier from day one."},
+        ]
+        self.assertEqual(sum(len(turn["text"].split()) for turn in draft), 42)
+        edited = {
+            "L1": "We nearly missed launch, but the team kept moving.",
+            "L2": "Your catch fixed our bug before orders doubled overnight.",
+            "L3": "Come back next year; we'll plan the launch sooner.",
+        }
+        sampling_during_calls = []
+        calls = []
+
+        def generate(**kwargs):
+            calls.append(kwargs)
+            sampling_during_calls.append(caller_sampling_enabled())
+            if len(sampling_during_calls) == 1:
+                return json.dumps({"turns": draft})
+            return json.dumps(edited)
+
+        result = draft_spoken_exchange(prompt, 10.125, generate, language="English")
+
+        lines = llm_service._extract_h3_dialogue_blocks(result)
+        self.assertEqual(lines, list(edited.values()))
+        edited_word_count = sum(len(line.split()) for line in lines)
+        self.assertGreaterEqual(edited_word_count, 22)
+        self.assertLessEqual(edited_word_count, 30)
+        self.assertLess(result.index("Kai (S1)"), result.index("Mina (S2)"))
+        self.assertLess(result.index("Mina (S2)"), result.index("Nora (S3)"))
+        self.assertEqual(sampling_during_calls, [False, True])
+        self.assertFalse(caller_sampling_enabled())
+        self.assertEqual(len(sampling_during_calls), 2)
+        self.assertIn("Return JSON turns with speaker and text", calls[0]["system_prompt"])
+        self.assertIn("mapping each supplied L-key to revised spoken text", calls[1]["system_prompt"])
+        self.assertNotIn("Return JSON turns with speaker and text", calls[1]["system_prompt"])
+        schema = calls[1]["json_schema"]
+        self.assertEqual(schema["required"], ["L1", "L2", "L3"])
+        self.assertEqual(schema["additionalProperties"], False)
+        self.assertEqual(set(schema["properties"]), {"L1", "L2", "L3"})
+        self.assertTrue(all(value == {"type": "string"} for value in schema["properties"].values()))
+        self.assertFalse(calls[1]["enable_thinking"])
+        self.assertEqual(calls[1]["thinking_budget"], 0)
+        self.assertIsNone(calls[1]["reasoning_effort"])
+        self.assertEqual(calls[1]["max_new_tokens"], 768)
+
+    def test_overlong_exchange_copyedit_must_still_fit_hard_word_limit(self):
+        prompt = "Nora, Kai, and Mina discuss the difficult holiday launch."
+        draft = [
+            {"speaker": "Kai", "text": "We nearly missed launch, but everyone kept moving when the schedule slipped badly twice."},
+            {"speaker": "Mina", "text": "I fixed the payment bug after Nora spotted how our holiday orders doubled overnight."},
+            {"speaker": "Nora", "text": "I want everyone back next year; let's make our launch easier from day one."},
+        ]
+        too_long = {f"L{i + 1}": turn["text"] for i, turn in enumerate(draft)}
+        generator = Mock(side_effect=[
+            json.dumps({"turns": draft}),
+            json.dumps(too_long),
+            json.dumps(too_long),
+            json.dumps(too_long),
+        ])
+
+        with self.assertRaisesRegex(ValueError, "could not complete the requested dialogue") as caught:
+            draft_spoken_exchange(prompt, 10.125, generator, language="English")
+
+        self.assertIn("Your exchange had 42 words; at most 30 allowed (aim for 24).", str(caught.exception.__cause__))
+        self.assertEqual(generator.call_count, 4)
+
+    def test_copyedit_rejects_missing_line_keys_and_under_minimum_text(self):
+        prompt = "Nora, Kai, and Mina discuss the difficult holiday launch. Include at least 22 spoken words."
+        draft = [
+            {"speaker": "Kai", "text": "We nearly missed launch, but everyone kept moving when the schedule slipped badly twice."},
+            {"speaker": "Mina", "text": "I fixed the payment bug after Nora spotted how our holiday orders doubled overnight."},
+            {"speaker": "Nora", "text": "I want everyone back next year; let's make our launch easier from day one."},
+        ]
+        invalid_edits = (
+            (None, "return revised text for every L-key"),
+            ({"L1": "We kept moving."}, "return revised text for every L-key"),
+            ({"L1": "", "L2": "Orders doubled overnight.", "L3": "Come back next year."},
+             "each revised turn needs spoken text"),
+            ({"L1": "We kept <d>moving</d>.", "L2": "Orders doubled overnight.", "L3": "Come back next year."},
+             "Return nonempty speaker/text pairs, without speech tags or newlines."),
+            ({"L1": "We kept\nmoving.", "L2": "Orders doubled overnight.", "L3": "Come back next year."},
+             "Return nonempty speaker/text pairs, without speech tags or newlines."),
+            ({"L1": "Yes.", "L2": "Right.", "L3": "Sure."},
+             "Your exchange had 3 words; use at least 22 total"),
+        )
+        for edit, reason in invalid_edits:
+            with self.subTest(edit=edit):
+                generator = Mock(side_effect=[json.dumps({"turns": draft}), json.dumps(edit)])
+                with self.assertRaisesRegex(ValueError, "could not complete the requested dialogue") as caught:
+                    draft_spoken_exchange(prompt, 10.125, generator, language="English")
+                self.assertIn(reason, str(caught.exception.__cause__))
+                self.assertEqual(generator.call_count, 2)
+
+    def test_single_window_repairs_only_unambiguous_missing_speaker_ids(self):
+        source = (
+            'Adult sisters Lena and Priya stand beside one red suitcase. '
+            'Lena places the ticket in Priya\'s left hand. Priya closes that hand '
+            'before the boarding gate opens. Lena says, "You hold the ticket." '
+            'Priya replies, "And you keep the suitcase." Add no other speech.'
+        )
+        draft = (
+            'integrated_multimodal_description: [Shot 1] Lena places the ticket in '
+            'Priya\'s left hand. Priya closes that hand before the boarding gate opens. '
+            'Lena says: <d>[English] You hold the ticket.</d> Priya replies: '
+            '<d>[English] And you keep the suitcase.</d> They walk through together.\n'
+            'overall_soundscape: Quiet terminal ambience.\n'
+            'non_diegetic_music: N/A'
+        )
+        expected = draft.replace(
+            '<d>[English] You hold the ticket.</d>',
+            '(S1) <d>[English] You hold the ticket.</d>',
+        ).replace(
+            '<d>[English] And you keep the suitcase.</d>',
+            '(S2) <d>[English] And you keep the suitcase.</d>',
+        )
+        repaired = llm_service._repair_unambiguous_h3_context_speaker_ids(source, draft)
+        self.assertEqual(repaired, expected)
+        self.assertIn('closes that hand before the boarding gate opens', repaired)
+        self.assertTrue(llm_service._h3_context_dialogue_binding_contract_satisfied(source, repaired))
+        self.assertEqual(
+            llm_service._repair_unambiguous_h3_context_speaker_ids(source, repaired),
+            repaired,
+        )
+
+        with patch.object(llm_service, 'generate', return_value=draft) as generate, \
+                patch('services.enhance_guides.get_enhance_guide', return_value='H3 guide'):
+            enhanced = llm_service.enhance_prompt(
+                prompt=source, mode='video', model_type='minimax_h3_fused_turbo',
+                duration_seconds=10.125, planning_style='adaptive', max_new_tokens=1280,
+            )
+        self.assertEqual(generate.call_count, 1)
+        self.assertIn('closes that hand before the boarding gate opens', enhanced)
+        self.assertIn('(S1) <d>[English] You hold the ticket.</d>', enhanced)
+        self.assertIn('(S2) <d>[English] And you keep the suitcase.</d>', enhanced)
+
+    def test_single_window_speaker_id_repair_declines_unsafe_bindings(self):
+        fields = lambda body: (
+            f'integrated_multimodal_description: [Shot 1] {body}\n'
+            'overall_soundscape: Quiet room tone.\nnon_diegetic_music: N/A'
+        )
+        source = 'Lena says, "Keep it." Priya replies, "I will."'
+        clean = fields(
+            'Lena says: <d>[English] Keep it.</d> '
+            'Priya replies: <d>[English] I will.</d>'
+        )
+        conflicting = clean.replace(
+            '<d>[English] Keep it.</d>', '(S2) <d>[English] Keep it.</d>'
+        )
+        self.assertEqual(
+            llm_service._repair_unambiguous_h3_context_speaker_ids(source, conflicting),
+            conflicting,
+        )
+        self.assertFalse(
+            llm_service._h3_context_dialogue_binding_contract_satisfied(source, conflicting)
+        )
+
+        unsafe = (
+            ('Lena says, "Keep it." Priya replies, "I will."',
+             fields('Lena says: <d>[English] Keep it.</d>')),  # missing line
+            ('Lena says, "Keep it." Priya replies, "I will."',
+             fields('Priya replies: <d>[English] I will.</d> Lena says: <d>[English] Keep it.</d>')),
+            ('Lena and Priya face each other. She says, "Keep it."',
+             fields('She says: <d>[English] Keep it.</d>')),
+            ('Lena and Priya say together, "Keep it."',
+             fields('Lena and Priya say together: <d>[English] Keep it.</d>')),
+            ('Lena says, "Keep it." Priya replies, "Keep it."',
+             fields('Lena says: <d>[English] Keep it.</d> Priya replies: <d>[English] Keep it.</d>')),
+            ('Lena says, "Keep it."',
+             fields('Priya says: <d>[English] Keep it.</d>')),
+        )
+        for unsafe_source, unsafe_draft in unsafe:
+            with self.subTest(source=unsafe_source, draft=unsafe_draft):
+                self.assertEqual(
+                    llm_service._repair_unambiguous_h3_context_speaker_ids(
+                        unsafe_source, unsafe_draft
+                    ),
+                    unsafe_draft,
+                )
+
+    def test_exact_dialogue_owner_ignores_a_possessive_listener_name(self):
+        source = (
+            'Ana says, <d>[English] You kept the blue ticket.</d> '
+            'Bea replies, <d>[English] I kept both of them.</d>'
+        )
+        for possessive in ("Ana's", "Ana’s"):
+            with self.subTest(possessive=possessive):
+                draft = (
+                    'integrated_multimodal_description: [Shot 1] '
+                    'Ana turns to Bea and says: '
+                    '<d>[English] You kept the blue ticket.</d> '
+                    'Bea looks down at the suitcase, then meets '
+                    f'{possessive} eyes and answers: '
+                    '<d>[English] I kept both of them.</d>\n'
+                    'overall_soundscape: Quiet room tone.\n'
+                    'non_diegetic_music: N/A'
+                )
+                entries = llm_service._unambiguous_h3_context_dialogue_entries(draft)
+                self.assertIsNotNone(entries)
+                self.assertEqual([entry["speaker"] for entry in entries], ["Ana", "Bea"])
+                repaired = llm_service._repair_unambiguous_h3_context_speaker_ids(
+                    source, draft,
+                )
+                self.assertIn('(S1) <d>[English] You kept the blue ticket.</d>', repaired)
+                self.assertIn('(S2) <d>[English] I kept both of them.</d>', repaired)
+                self.assertTrue(
+                    llm_service._h3_context_dialogue_binding_contract_satisfied(
+                        source, repaired,
+                    )
+                )
+
+                switched = draft.replace(
+                    f'Bea looks down at the suitcase, then meets {possessive} eyes and answers:',
+                    'Bea looks down at the suitcase while Ana answers:',
+                )
+                self.assertEqual(
+                    llm_service._repair_unambiguous_h3_context_speaker_ids(source, switched),
+                    switched,
+                )
+                self.assertFalse(
+                    llm_service._h3_context_dialogue_binding_contract_satisfied(
+                        source, switched,
+                    )
+                )
+
+                ambiguous = draft.replace(
+                    f'Bea looks down at the suitcase, then meets {possessive} eyes and answers:',
+                    'Bea and Ana look down at the suitcase and answer:',
+                )
+                self.assertEqual(
+                    llm_service._repair_unambiguous_h3_context_speaker_ids(source, ambiguous),
+                    ambiguous,
+                )
+                self.assertFalse(
+                    llm_service._h3_context_dialogue_binding_contract_satisfied(
+                        source, ambiguous,
+                    )
+                )
+
+    def test_responding_gerund_preserves_dialogue_owner_and_rejects_unsafe_binding(self):
+        source = (
+            'Ana says, <d>[English] You kept the blue ticket.</d> '
+            'Bea answers, <d>[English] I kept both of them.</d>'
+        )
+        for possessive in ("Ana's", "Ana’s"):
+            with self.subTest(possessive=possessive):
+                cue = (
+                    'Bea lowers her gaze to the suitcase handle, then meets '
+                    f'{possessive} eyes, responding with a calm, steady voice:'
+                )
+                draft = (
+                    'integrated_multimodal_description: [Shot 1] '
+                    'Ana turns to Bea and says: '
+                    '<d>[English] You kept the blue ticket.</d> '
+                    f'{cue} <d>[English] I kept both of them.</d>\n'
+                    'overall_soundscape: Quiet room tone.\n'
+                    'non_diegetic_music: N/A'
+                )
+                entries = llm_service._unambiguous_h3_context_dialogue_entries(draft)
+                self.assertIsNotNone(entries)
+                self.assertEqual([entry["speaker"] for entry in entries], ["Ana", "Bea"])
+                repaired = llm_service._repair_unambiguous_h3_context_speaker_ids(
+                    source, draft,
+                )
+                self.assertIn('(S1) <d>[English] You kept the blue ticket.</d>', repaired)
+                self.assertIn('(S2) <d>[English] I kept both of them.</d>', repaired)
+                self.assertTrue(
+                    llm_service._h3_context_dialogue_binding_contract_satisfied(
+                        source, repaired,
+                    )
+                )
+
+                switched = draft.replace(
+                    cue,
+                    'Bea lowers her gaze to the suitcase handle while Ana answers:',
+                )
+                self.assertEqual(
+                    llm_service._repair_unambiguous_h3_context_speaker_ids(source, switched),
+                    switched,
+                )
+                self.assertFalse(
+                    llm_service._h3_context_dialogue_binding_contract_satisfied(
+                        source, switched,
+                    )
+                )
+
+                ambiguous = draft.replace(
+                    cue,
+                    'Bea and Ana lower their gazes to the suitcase, '
+                    'responding with a calm, steady voice:',
+                )
+                self.assertEqual(
+                    llm_service._repair_unambiguous_h3_context_speaker_ids(
+                        source, ambiguous,
+                    ),
+                    ambiguous,
+                )
+                self.assertFalse(
+                    llm_service._h3_context_dialogue_binding_contract_satisfied(
+                        source, ambiguous,
+                    )
+                )
+
+    def test_parenthesized_h3_voice_markers_are_not_natural_speaker_names(self):
+        source = (
+            'Ana (S1) says, <d>[English] You kept the blue ticket.</d> '
+            'Bea (S2) replies, <d>[English] I kept both of them.</d>'
+        )
+        draft = (
+            'integrated_multimodal_description: [Shot 1] '
+            'Ana (S1) gestures toward Bea and speaks: '
+            '<d>[English] You kept the blue ticket.</d> '
+            'Bea(S2) lowers her gaze to the suitcase handle and responds: '
+            '<d>[English] I kept both of them.</d>\n'
+            'overall_soundscape: Quiet room tone.\n'
+            'non_diegetic_music: N/A'
+        )
+        entries = llm_service._unambiguous_h3_context_dialogue_entries(draft)
+        self.assertIsNotNone(entries)
+        self.assertEqual([entry["speaker"] for entry in entries], ["Ana", "Bea"])
+        repaired = llm_service._repair_unambiguous_h3_context_speaker_ids(
+            source, draft,
+        )
+        self.assertIn('(S1) <d>[English] You kept the blue ticket.</d>', repaired)
+        self.assertIn('(S2) <d>[English] I kept both of them.</d>', repaired)
+        self.assertTrue(
+            llm_service._h3_context_dialogue_binding_contract_satisfied(
+                source, repaired,
+            )
+        )
+
+        wrong_owner = draft.replace(
+            'Ana (S1) gestures toward Bea and speaks:',
+            'Bea (S2) gestures toward Ana and speaks:',
+        ).replace(
+            'Bea(S2) lowers her gaze to the suitcase handle and responds:',
+            'Ana(S1) lowers her gaze to the suitcase handle and responds:',
+        )
+        self.assertFalse(
+            llm_service._h3_context_dialogue_binding_contract_satisfied(
+                source, wrong_owner,
+            )
+        )
+
+        ambiguous = draft.replace(
+            'Bea(S2) lowers her gaze to the suitcase handle and responds:',
+            'Bea (S2) and Ana (S1) lower their gazes, '
+            'responding with a calm, steady voice:',
+        )
+        self.assertFalse(
+            llm_service._h3_context_dialogue_binding_contract_satisfied(
+                source, ambiguous,
+            )
+        )
+
+    def test_from_timestamp_named_speech_cues_bind_only_unambiguous_subjects(self):
+        source = (
+            'Ana (S1) says, <d>[English] Hold the door.</d> '
+            'Bea (S2) replies, <d>[English] I have it.</d>'
+        )
+        draft = (
+            'integrated_multimodal_description: [Shot 1] '
+            'From 2.50 to 4.50 seconds, Ana steadies the lantern as she says: '
+            '<d>[English] Hold the door.</d> The door swings gently shut. '
+            'From 6.50 to 9.50 seconds, Bea checks the doorway before replying: '
+            '<d>[English] I have it.</d>\n'
+            'overall_soundscape: Quiet room tone.\n'
+            'non_diegetic_music: N/A'
+        )
+        repaired = llm_service._repair_unambiguous_h3_context_speaker_ids(
+            source, draft,
+        )
+        self.assertIn('(S1) <d>[English] Hold the door.</d>', repaired)
+        self.assertIn('(S2) <d>[English] I have it.</d>', repaired)
+        self.assertTrue(
+            llm_service._h3_context_dialogue_binding_contract_satisfied(
+                source, repaired,
+            )
+        )
+
+        ambiguous = draft.replace(
+            'Bea checks the doorway before replying:',
+            'Ana turns toward Bea, then she replies:',
+        )
+        self.assertEqual(
+            llm_service._repair_unambiguous_h3_context_speaker_ids(
+                source, ambiguous,
+            ),
+            ambiguous,
+        )
+        self.assertFalse(
+            llm_service._h3_context_dialogue_binding_contract_satisfied(
+                source, ambiguous,
+            )
+        )
+
+    def test_exact_raw_qwen_and_gemma_four_turn_plans_bind_named_speakers(self):
+        source = (
+            'At a quiet railway platform before dawn, adult sisters Ana and Bea wait beside one suitcase. '
+            'Preserve these words exactly and assign them to the named speaker. '
+            'Ana says, "You kept the blue ticket." Bea answers, "I kept both of them." '
+            'Ana asks, "Then why are you still here?" Bea replies, "Because you are." '
+            'Allow enough natural time for every line, reaction, and pause. '
+            'Do not add, remove, paraphrase, split, or reorder dialogue.'
+        )
+        raw_plans = (
+            (
+                'qwen-last-planning-call',
+                'integrated_multimodal_description: [Shot 1] A quiet railway platform before dawn, '
+                'bathed in cool blue twilight and faint amber lamp light. Adult sisters Ana (dark wool coat) '
+                'and Bea (grey trench coat) stand beside a worn leather suitcase. The camera holds a static '
+                'medium two-shot from the waist up. At 0.00 seconds, Ana shifts her weight and speaks with a '
+                'quiet, accusatory tone: <d>[English] You kept the blue ticket.</d> Bea lowers her gaze to '
+                'the suitcase handle, responding with a calm, steady voice: '
+                '<d>[English] I kept both of them.</d> Ana’s eyes narrow as she steps closer, her voice '
+                'rising in confusion: <d>[English] Then why are you still here?</d> Bea looks up, meeting '
+                'Ana’s gaze with a soft, resolute expression, and replies: '
+                '<d>[English] Because you are.</d> Both sisters remain silent with their mouths closed. '
+                'Ana holds her breath, staring at Bea, while Bea maintains eye contact. The camera holds on '
+                'their frozen standoff as a distant train whistle approaches.\n'
+                'overall_soundscape: Low ambient wind on the open platform, the subtle creak of the suitcase '
+                'handle, and a distant, low-frequency train whistle fading in near the end.\n'
+                'non_diegetic_music: N/A'
+            ),
+            (
+                'gemma-last-planning-call',
+                'integrated_multimodal_description: [Shot 1] Live-action drama, a medium two-shot holds '
+                'on two adult sisters, Ana and Bea, standing closely beside one worn leather suitcase on a '
+                'deserted, damp railway platform just before dawn. The lighting is cool, deep blue, transitioning '
+                'to faint orange streaks on the horizon behind them. Ana (S1), in a muted grey knit sweater and '
+                'dark jeans, stands slightly forward, gazing intently at Bea. Bea (S2), in a deep burgundy '
+                'cardigan and black slacks, stands beside her, gripping the suitcase handle. At 0:00.00 seconds, '
+                'Ana (S1) gestures subtly toward the suitcase while her mouth is closed, then opens to speak: '
+                '<d>[English] You kept the blue ticket.</d> Bea (S2) slowly looks down at the suitcase, then '
+                'raises her eyes back to Ana, and responds with a soft, steady voice: '
+                '<d>[English] I kept both of them.</d> Ana (S1) tilts her head, a questioning frown creasing '
+                'her brow, and speaks: <d>[English] Then why are you still here?</d> Bea (S2) offers a small, '
+                'meaningful smile, her posture relaxing slightly as she answers: '
+                '<d>[English] Because you are.</d> They hold this intimate gaze; Bea leans slightly into Ana, '
+                'and the first orange light catches the dampness of the platform tiles as the scene holds through '
+                'the final moment.\n'
+                'overall_soundscape: Profound silence pervades the platform, punctuated by the gentle, rhythmic '
+                'drip of condensation from the station awning and the occasional faint, distant whistle sighing '
+                'in the cooling morning air.\n'
+                'non_diegetic_music: A very low, sustained, warm cello note swells subtly beneath the dialogue, '
+                'evoking anticipation and melancholy.'
+            ),
+        )
+        for label, draft in raw_plans:
+            with self.subTest(writer=label):
+                entries = llm_service._unambiguous_h3_context_dialogue_entries(draft)
+                self.assertIsNotNone(entries)
+                self.assertEqual(
+                    [entry.get('speaker') for entry in entries],
+                    ['Ana', 'Bea', 'Ana', 'Bea'],
+                )
+                repaired = llm_service._repair_unambiguous_h3_context_speaker_ids(
+                    source, draft,
+                )
+                self.assertTrue(
+                    llm_service._h3_context_dialogue_binding_contract_satisfied(
+                        source, repaired,
+                    ),
+                    msg=f'{label}: strict speaker binding rejected the repaired raw plan.',
+                )
+                for speaker_id, words in (
+                    (1, 'You kept the blue ticket.'),
+                    (2, 'I kept both of them.'),
+                    (1, 'Then why are you still here?'),
+                    (2, 'Because you are.'),
+                ):
+                    self.assertIn(
+                        f'(S{speaker_id}) <d>[English] {words}</d>', repaired,
+                    )
+
+    def test_adaptive_script_markers_repair_frame_writer_ids_without_rewrite(self):
+        source = (
+            'A concise four-turn repair conversation.\n\n'
+            'Spoken script for this adaptation.\n'
+            'Nia (S1) says, <d>[English] That pad rubs.</d>\n'
+            'Omar (S2) says, <d>[English] What shifted?</d>\n'
+            'Nia (S1) says, <d>[English] Caliper is off-center.</d>\n'
+            'Omar (S2) says, <d>[English] Centering it fixes that.</d>'
+        )
+        draft = (
+            'integrated_multimodal_description: [Shot 1] Nia (S1), in a navy apron, '
+            'and Omar (S2), in a grey shirt, inspect one brake. '
+            'Nia says: <d>[English] That pad rubs.</d> '
+            'Omar asks: <d>[English] What shifted?</d> '
+            'Nia explains: <d>[English] Caliper is off-center.</d> '
+            'Omar replies: <d>[English] Centering it fixes that.</d> '
+            'They center the caliper, spin the wheel, and hear the rubbing stop.\n'
+            'overall_soundscape: Workshop room tone and tool clicks.\n'
+            'non_diegetic_music: N/A'
+        )
+        repaired = llm_service._repair_unambiguous_h3_context_speaker_ids(source, draft)
+        for speaker_id, words in (
+            (1, 'That pad rubs.'),
+            (2, 'What shifted?'),
+            (1, 'Caliper is off-center.'),
+            (2, 'Centering it fixes that.'),
+        ):
+            self.assertIn(f'(S{speaker_id}) <d>[English] {words}</d>', repaired)
+        self.assertIn('center the caliper, spin the wheel, and hear the rubbing stop', repaired)
+        self.assertTrue(llm_service._h3_dialogue_contract_satisfied(source, repaired))
+        self.assertTrue(llm_service._h3_context_dialogue_binding_contract_satisfied(source, repaired))
+
+    def test_real_adaptive_exchange_keeps_jerry_michael_ron_speaker_ids(self):
+        prompt = (
+            'Jerry Seinfeld, Michael Scott from The Office, and Ron Swanson from Parks and Rec '
+            'are standing and talking to each other at a company holiday party. Write one brief, '
+            'natural exchange appropriate to their distinct personalities.'
+        )
+        turns = [
+            {'speaker': 'Michael Scott', 'text': 'Ron, are you a fan of the office?'},
+            {'speaker': 'Ron Swanson', 'text': 'I am a fan of the meat.'},
+            {'speaker': 'Jerry Seinfeld', 'text': 'Wait, which meat?'},
+        ]
+        visual_draft = (
+            'integrated_multimodal_description: [Shot 1] Jerry Seinfeld, Michael Scott, and '
+            'Ron Swanson stand together at the company holiday party. Michael gestures expansively '
+            'and speaks: <d>[English] Ron, are you a fan of the office?</d> Ron remains stoic and '
+            'replies: <d>[English] I am a fan of the meat.</d> Jerry raises an eyebrow and asks: '
+            '<d>[English] Wait, which meat?</d>\n'
+            'overall_soundscape: Distant party chatter and faint instrumental holiday music.\n'
+            'non_diegetic_music: N/A'
+        )
+        with patch.object(llm_service, 'generate', side_effect=[
+            json.dumps({'turns': turns}), visual_draft,
+        ]) as generate, patch(
+            'services.enhance_guides.get_enhance_guide', return_value='H3 guide',
+        ):
+            enhanced = llm_service.enhance_prompt(
+                prompt=prompt,
+                mode='video',
+                model_type='minimax_h3_fused_turbo',
+                duration_seconds=10.125,
+                planning_style='adaptive',
+                max_new_tokens=1280,
+            )
+
+        self.assertEqual(generate.call_count, 2)
+        authored_request = generate.call_args_list[1].kwargs['prompt']
+        script_start = authored_request.index('Spoken script for this adaptation.')
+        authored_script = authored_request[script_start:]
+        script_entries = llm_service._unambiguous_h3_context_dialogue_entries(authored_script)
+        self.assertIsNotNone(script_entries)
+        self.assertEqual(
+            [(entry.get('speaker'), entry['speaker_id']) for entry in script_entries],
+            [('Michael Scott', 1), ('Ron Swanson', 2), ('Jerry Seinfeld', 3)],
+        )
+        compiled_script = llm_service._compile_h3_explicit_dialogue(authored_script)
+        for name, speaker_id, words in (
+            ('Michael Scott', 1, 'Ron, are you a fan of the office?'),
+            ('Ron Swanson', 2, 'I am a fan of the meat.'),
+            ('Jerry Seinfeld', 3, 'Wait, which meat?'),
+        ):
+            self.assertIn(
+                f'{name} (S{speaker_id}) says, <d>[English] {words}</d>',
+                compiled_script,
+            )
+        self.assertIn('Michael gestures expansively and speaks: (S1) <d>[English] Ron, are you a fan of the office?</d>', enhanced)
+        self.assertIn('Ron remains stoic and replies: (S2) <d>[English] I am a fan of the meat.</d>', enhanced)
+        self.assertIn('Jerry raises an eyebrow and asks: (S3) <d>[English] Wait, which meat?</d>', enhanced)
+        self.assertTrue(
+            llm_service._h3_context_dialogue_binding_contract_satisfied(
+                authored_script, enhanced,
+            )
+        )
+
+    def test_short_speaker_names_are_rejected_when_source_names_are_ambiguous(self):
+        source = (
+            'Michael Scott (S1) says, <d>[English] That was thoughtful.</d> '
+            'Michael Jordan (S2) replies, <d>[English] I appreciate it.</d>'
+        )
+        draft = (
+            'integrated_multimodal_description: [Shot 1] Michael says: '
+            '<d>[English] That was thoughtful.</d> Michael replies: '
+            '<d>[English] I appreciate it.</d>\n'
+            'overall_soundscape: Quiet room tone.\n'
+            'non_diegetic_music: N/A'
+        )
+        self.assertEqual(
+            llm_service._repair_unambiguous_h3_context_speaker_ids(source, draft),
+            draft,
+        )
+        self.assertFalse(
+            llm_service._h3_context_dialogue_binding_contract_satisfied(source, draft)
+        )
+
+        full_and_short = (
+            'Michael (S1) says, <d>[English] That was thoughtful.</d> '
+            'Michael Scott (S2) replies, <d>[English] I appreciate it.</d>'
+        )
+        shortened = (
+            'integrated_multimodal_description: [Shot 1] Michael says: '
+            '<d>[English] That was thoughtful.</d> Michael says: '
+            '<d>[English] I appreciate it.</d>\n'
+            'overall_soundscape: Quiet room tone.\n'
+            'non_diegetic_music: N/A'
+        )
+        self.assertEqual(
+            llm_service._repair_unambiguous_h3_context_speaker_ids(
+                full_and_short, shortened,
+            ),
+            shortened,
+        )
+        self.assertFalse(
+            llm_service._h3_context_dialogue_binding_contract_satisfied(
+                full_and_short, shortened,
+            )
+        )
+
+    def test_pronoun_continuation_repairs_only_proven_previous_owner(self):
+        source = 'Theo (S1) says, <d>[English] Thanks, you saved it.</d>'
+        fields = lambda action: (
+            f'integrated_multimodal_description: [Shot 1] {action}\n'
+            'overall_soundscape: Rain and one relieved laugh.\n'
+            'non_diegetic_music: N/A'
+        )
+        sound = fields(
+            'Theo takes his umbrella back and exhales one short relieved laugh. '
+            'He looks directly at Mina and says: <d>[English] Thanks, you saved it.</d> '
+            'Mina silently nods.'
+        )
+        repaired = llm_service._repair_unambiguous_h3_context_speaker_ids(source, sound)
+        self.assertIn('(S1) <d>[English] Thanks, you saved it.</d>', repaired)
+        self.assertIn('exhales one short relieved laugh', repaired)
+        self.assertTrue(llm_service._h3_context_dialogue_binding_contract_satisfied(source, repaired))
+
+        unsafe = (
+            fields('Theo stands beside Mina. She says: <d>[English] Thanks, you saved it.</d>'),
+            fields('Theo and Dev wait. He says: <d>[English] Thanks, you saved it.</d>'),
+            fields('Theo watches Dev take his coat. He looks at Mina and says: '
+                   '<d>[English] Thanks, you saved it.</d>'),
+            fields('Theo takes his umbrella. He smiles while Dev says: '
+                   '<d>[English] Thanks, you saved it.</d>'),
+            fields('Theo watches the man take his coat. He looks at Mina and says: '
+                   '<d>[English] Thanks, you saved it.</d>'),
+            fields('Dev takes his coat. He looks at Mina and says: '
+                   '<d>[English] Thanks, you saved it.</d>'),
+        )
+        for draft in unsafe:
+            with self.subTest(draft=draft):
+                self.assertEqual(
+                    llm_service._repair_unambiguous_h3_context_speaker_ids(source, draft),
+                    draft,
+                )
+
+    def test_adaptive_source_fallback_does_not_fabricate_early_speech_clock(self):
+        source = (
+            'An umbrella rolls toward traffic. Mina catches it, Theo takes it back, '
+            'gives one relieved laugh, then Theo (S1) says, '
+            '<d>[English] Thanks.</d> Mina silently nods.'
+        )
+        fallback = llm_service._build_h3_context_fallback(
+            source,
+            has_start_image=False,
+            duration_seconds=14.375,
+            planning_style='adaptive',
+        )
+        self.assertNotIn('approximately 0.25 seconds', fallback)
+        self.assertIn('after every action that causes or motivates it', fallback)
+        self.assertIn('Preserve requested nonverbal reactions such as a laugh', fallback)
+        self.assertIn('gives one relieved laugh', fallback)
+        self.assertIn('Theo (S1) says, <d>[English] Thanks.</d>', fallback)
+        self.assertEqual(fallback.count('(S1)'), 1)
+        self.assertNotIn('all mouths remain closed before and after it', fallback)
+        self.assertNotIn('no human voices, whispers, grunts', fallback)
+
+        faithful = llm_service._build_h3_context_fallback(
+            source,
+            has_start_image=False,
+            duration_seconds=14.375,
+        )
+        self.assertIn('approximately 0.25 seconds', faithful)
+
+        ref2va = llm_service._build_h3_ref2va_tagged_fallback(
+            source,
+            '<Subject 1> is Theo from <Picture 1>, preserving identity.',
+            duration_seconds=14.375,
+            planning_style='adaptive',
+        )
+        self.assertNotIn('approximately 0.25 seconds', ref2va)
+        self.assertNotIn('all mouths remain closed before and after it', ref2va)
+        self.assertNotIn('no human voices, whispers, grunts', ref2va)
+        self.assertIn('Preserve explicitly requested nonverbal reactions', ref2va)
+
+    def test_adaptive_silent_fallback_preserves_requested_nonverbal_reaction(self):
+        source = (
+            'Mina catches the rolling umbrella. Theo takes it back, gives one relieved laugh, '
+            'and Mina silently nods. No spoken words.'
+        )
+        for fallback in (
+            llm_service._build_h3_context_fallback(
+                source,
+                has_start_image=False,
+                duration_seconds=14.375,
+                planning_style='adaptive',
+            ),
+            llm_service._build_h3_ref2va_tagged_fallback(
+                source,
+                '<Subject 1> is Theo from <Picture 1>, preserving identity.',
+                duration_seconds=14.375,
+                planning_style='adaptive',
+            ),
+        ):
+            with self.subTest(fallback=fallback):
+                self.assertIn('gives one relieved laugh', fallback)
+                self.assertIn('silently nods', fallback)
+                self.assertRegex(
+                    fallback,
+                    r'(?:Add no|Do not add new) spoken words or speech-like vocalizations',
+                )
+                self.assertIn('Preserve explicitly requested nonverbal reactions', fallback)
+                self.assertNotIn('approximately 0.25 seconds', fallback)
+                self.assertNotIn('all mouths remain closed before and after it', fallback)
+                self.assertNotIn('no human voices, whispers, grunts', fallback)
+
+    def test_screenplay_contract_is_shared_by_single_and_multi_window_paths(self):
+        from services.h3_story_ledger import extract_locked_dialogue
+        for heading in ('## Cast', '**Characters**', '__Roles__', '[Subjects]'):
+            for first, second in (('Nora', 'Kai'), ('Astronomer', 'Assistant')):
+                with self.subTest(heading=heading, first=first):
+                    source = (f'{heading}\n{first}: a gray coat and a red scarf.\n'
+                              f'{second}: a brown jacket and a wool cap.\n## Scene\n'
+                              f'{first}: Is the lens ready?\n{second}: Yes. Look at that star.\n')
+                    exact = [item['text'] for item in extract_locked_dialogue(source)]
+                    self.assertEqual(llm_service._extract_h3_quoted_dialogue(source), exact)
+                    self.assertTrue(llm_service._h3_requests_speech(source))
+                    silent = ('integrated_multimodal_description: [Shot 1] They adjust a telescope.\n'
+                              'overall_soundscape: Wind.\nnon_diegetic_music: N/A')
+                    self.assertFalse(llm_service._h3_dialogue_contract_satisfied(source, silent))
+                    compiled = llm_service._compile_h3_explicit_dialogue(source)
+                    self.assertIn(f'{first}: (S1) <d>[English] Is the lens ready?</d>', compiled)
+                    self.assertIn(f'{second}: (S2) <d>[English] Yes. Look at that star.</d>', compiled)
+                    self.assertEqual(llm_service._extract_h3_dialogue_blocks(compiled), exact)
+                    self.assertTrue(llm_service._h3_dialogue_contract_satisfied(source, compiled))
+                    self.assertEqual(llm_service._compile_h3_explicit_dialogue(compiled), compiled)
+
+    def test_profile_quotes_are_not_speech_in_single_window_contract(self):
+        source = ('## Characters\nNora: "the careful one", wearing a gray coat.\n'
+                  '## Scene\nNora adjusts a telescope.')
+        self.assertEqual(llm_service._extract_h3_quoted_dialogue(source), [])
+        self.assertFalse(llm_service._h3_requests_speech(source))
+
+    def test_screenplay_repairs_preserve_returning_speaker_and_reference_identity(self):
+        source = 'Nora: Is it ready?\nKai: It is.\nNora: Then go.'
+        self.assertEqual([e['speaker_id'] for e in llm_service._extract_h3_source_dialogue_entries(source)], [1, 2, 1])
+        draft = ('integrated_multimodal_description: [Shot 1] Nora and Kai wait.\n'
+                 'overall_soundscape: Wind.\nnon_diegetic_music: N/A')
+        repaired = llm_service._inject_missing_h3_dialogue(draft, source, ref2va=False)
+        self.assertIn('Nora (S1) says exactly once: <d>[English] Then go.</d>', repaired)
+        self.assertIn('Kai (S2) says exactly once: <d>[English] It is.</d>', repaired)
+        refs = ('Saved character "Kai" is exactly <Subject 1>: <Picture 1> defines this character.\n'
+                'Saved character "Nora" is exactly <Subject 2>: <Picture 2> defines this character.')
+        entries = llm_service._extract_h3_source_dialogue_entries(source, refs)
+        self.assertEqual([(e['subject_id'], e['speaker_id']) for e in entries], [(2, 1), (1, 2), (2, 1)])
+
+    def test_silence_lists_have_consistent_scope_with_conjunctions(self):
+        for restriction in ('No narration or dialogue.', 'No music and speech.',
+                            'No subtitles, music, or dialogue.'):
+            with self.subTest(restriction=restriction):
+                source = 'A tortoise crosses the garden. ' + restriction
+                self.assertTrue(dialogue_forbidden(source))
+                self.assertFalse(adaptive_dialogue_expected(source))
+                self.assertFalse(llm_service._h3_requests_speech(source))
+        self.assertFalse(dialogue_forbidden('No music or dialogue before five seconds. Then Nora speaks.'))
+        self.assertFalse(dialogue_forbidden('No music or dialogue begins later.'))
+        self.assertFalse(dialogue_forbidden('Nora says, "No narration or dialogue."'))
+
+    def test_native_output_retains_visible_words_and_does_not_invent_voice_assets(self):
+        source = 'Mae hands Jules a note that reads "Platform 4". Mae says, "Keep this safe."'
+        draft = ('subject_definitions: Mae and Jules.\nsummary: A handoff.\nretention_analysis: N/A\n'
+                 'detailed_description: [Shot 1] Mae hands Jules a note. Mae (S1) says in an off-screen voiceover, '
+                 '<d>[English] Keep this safe.</d>\noverall_soundscape: Paper.\nnon_diegetic_music: N/A')
+        result = llm_service._preserve_adaptive_h3_literals(source, draft)
+        self.assertIn('note displays the exact text "Platform 4"', result)
+        self.assertEqual(result.count('Mae hands Jules'), 1)
+        self.assertNotIn('off-screen voiceover', result)
+        self.assertEqual(llm_service._extract_h3_dialogue_blocks(result), ['Keep this safe.'])
+        self.assertEqual(llm_service._preserve_adaptive_h3_literals(source, result), result)
+        self.assertIn('off-screen voiceover', llm_service._preserve_adaptive_h3_literals(source + ' Mae speaks in voiceover.', draft))
+        self.assertNotIn('voice referenced from N/A', llm_service._preserve_adaptive_h3_literals(source, draft.replace('an off-screen voiceover', 'the voice referenced from N/A')))
+
+    def test_exchange_stage_locks_spoken_words_and_speaker_order_for_visual_writer(self):
+        prompt = 'Mina and Theo discuss why he ignored her letter, ending with Mina asking him to stay.'
+        turns = [{'speaker': 'Mina', 'text': 'Ten years, Theo. Why did you never answer my letter?'},
+                 {'speaker': 'Theo', 'text': 'I was ashamed. I thought you had already forgotten me.'},
+                 {'speaker': 'Mina', 'text': 'I never did. Stay with me tonight. We have so much to say.'}]
+        generator = Mock(return_value=json.dumps({'turns': turns}))
+        result = draft_spoken_exchange(prompt, 14.375, generator, language='English')
+        self.assertTrue(result.startswith(prompt))
+        self.assertEqual(llm_service._extract_h3_dialogue_blocks(result), [turn['text'] for turn in turns])
+        self.assertEqual(result.count('Mina (S1)'), 2)
+        self.assertIn('Theo (S2)', result)
+        self.assertNotRegex(result, r'\d+(?:\.\d+)?[–-]\d+(?:\.\d+)? seconds')
+        self.assertIn('story and camera scheduler owns their timing', result)
+        self.assertTrue(llm_service._h3_dialogue_contract_satisfied(result, result))
+        generator.assert_called_once()
+
+    def test_unique_speaker_shortening_uses_the_requested_full_name_for_stable_ids(self):
+        prompt = (
+            "At a quiet station, Ana Smith, Bea Jones, and Cal Reed talk to each other "
+            "about the train delay."
+        )
+        turns = [
+            {"speaker": "Ana", "text": "The train is delayed."},
+            {"speaker": "Ana Smith", "text": "We can wait inside."},
+            {"speaker": "Bea Jones", "text": "I'll check the board."},
+            {"speaker": "Cal Reed", "text": "I'll bring the bags."},
+        ]
+        generator = Mock(return_value=json.dumps({"turns": turns}))
+
+        result = draft_spoken_exchange(prompt, 10.125, generator, language="English")
+
+        self.assertEqual(result.count("Ana Smith (S1)"), 2)
+        self.assertNotIn("Ana (S", result)
+        self.assertIn("Bea Jones (S2)", result)
+        self.assertIn("Cal Reed (S3)", result)
+        generator.assert_called_once()
+
+    def test_ambiguous_first_name_is_not_merged_into_a_requested_actor(self):
+        prompt = (
+            "At a quiet station, Ana Smith, Ana Jones, and Bea Lee talk to each other "
+            "about the train delay."
+        )
+        turns = [
+            {"speaker": "Ana", "text": "The train is delayed."},
+            {"speaker": "Ana Jones", "text": "We can wait inside."},
+            {"speaker": "Bea Lee", "text": "I'll check the board."},
+        ]
+        generator = Mock(return_value=json.dumps({"turns": turns}))
+
+        with self.assertRaisesRegex(ValueError, "could not complete the requested dialogue"):
+            draft_spoken_exchange(prompt, 10.125, generator, language="English")
+
+        self.assertEqual(generator.call_count, 2)
+
+    def test_concise_four_turn_exchange_is_not_rejected_for_missing_filler(self):
+        prompt = (
+            "Adult mechanics Nia and Omar have a concise natural four-turn conversation: "
+            "Nia identifies the rubbing pad, Omar asks what shifted, Nia explains the "
+            "caliper is off-center, and Omar confirms the fix after centering it."
+        )
+        turns = [
+            {'speaker': 'Nia', 'text': 'Front pad is rubbing.'},
+            {'speaker': 'Omar', 'text': 'What shifted?'},
+            {'speaker': 'Nia', 'text': 'The caliper is off-center.'},
+            {'speaker': 'Omar', 'text': 'Centered. The rubbing stopped.'},
+        ]
+        generator = Mock(return_value=json.dumps({'turns': turns}))
+        result = draft_spoken_exchange(prompt, 14.375, generator, language='English')
+        self.assertEqual(llm_service._extract_h3_dialogue_blocks(result), [
+            turn['text'] for turn in turns
+        ])
+        request = generator.call_args.kwargs['prompt']
+        self.assertIn('Use exactly 4 concise turns and aim for 14 spoken words', request)
+        self.assertIn('duration-derived minimum 8 is a target', request)
+
+    def test_complete_group_exchange_below_duration_minimum_is_accepted_as_natural(self):
+        prompt = (
+            "At a holiday party, Jerry Seinfeld, Michael Scott, and Ron Swanson all "
+            "stand and talk to each other."
+        )
+        turns = [
+            {"speaker": "Jerry Seinfeld", "text": "That turkey disappeared before our holiday party started."},
+            {"speaker": "Michael Scott", "text": "I brought it home because the office oven broke."},
+            {"speaker": "Ron Swanson", "text": "It was delicious."},
+        ]
+        self.assertEqual(sum(spoken_word_count(turn["text"]) for turn in turns), 20)
+        generator = Mock(return_value=json.dumps({"turns": turns}))
+        result = draft_spoken_exchange(prompt, 10.125, generator, language="English")
+
+        self.assertEqual(llm_service._extract_h3_dialogue_blocks(result), [
+            turn["text"] for turn in turns
+        ])
+        self.assertIn("duration-derived minimum 22 is a target", generator.call_args.kwargs["prompt"])
+        generator.assert_called_once()
+
+    def test_short_incomplete_conversation_reports_missing_speaker_before_word_target(self):
+        prompt = "Write a short conversation between two strangers waiting for a delayed train."
+        generator = Mock(return_value=json.dumps({"turns": [
+            {"speaker": "Anxious Passenger", "text": "Miss dinner? Let's walk together."},
+        ]}))
+        with self.assertRaises(ValueError) as caught:
+            draft_spoken_exchange(prompt, 10.125, generator, language="English")
+        self.assertIn("needs at least two distinct speakers", str(caught.exception))
+        self.assertNotIn("use at least", str(caught.exception))
+        self.assertEqual(generator.call_count, 2)
+
+    def test_empty_silent_action_row_is_not_treated_as_failed_speech(self):
+        prompt = (
+            "Mina catches Theo's umbrella. Theo takes it back, laughs, and blurts one "
+            "brief natural thank-you. Keep his reaction to one short line; this is not "
+            "a conversation. Mina answers only with a silent nod."
+        )
+        generator = Mock(return_value=json.dumps({'turns': [
+            {'speaker': 'Mina', 'text': ''},
+            {'speaker': 'Theo', 'text': 'Thanks.'},
+        ]}))
+        result = draft_spoken_exchange(prompt, 14.375, generator, language='English')
+        self.assertEqual(llm_service._extract_h3_dialogue_blocks(result), ['Thanks.'])
+        self.assertNotIn('Mina (S', result)
+        self.assertIn('Theo (S1)', result)
+        generator.assert_called_once()
+
+    def test_exchange_stage_skips_silent_and_exact_scripts_and_rejects_overlong_speech(self):
+        generator = Mock()
+        for prompt in [CONCEPT, 'Mina says, "Stay." Theo replies, "Yes." Only use these lines.']:
+            self.assertEqual(draft_spoken_exchange(prompt, 14, generator, language='English'), prompt)
+        generator.assert_not_called()
+        generator.return_value = json.dumps({'turns': [{'speaker': 'Mina', 'text': 'word ' * 100}]})
+        with self.assertRaisesRegex(ValueError, 'could not complete the requested dialogue'):
+            draft_spoken_exchange('Mina and Theo discuss the letter.', 14, generator, language='English')
+        self.assertEqual(generator.call_count, 2)
+
+    def test_over_budget_failure_surfaces_last_reason_duration_and_safe_logs(self):
+        prompt = 'Mina and Theo discuss the missing letter.'
+        private_draft = 'They discuss the old letter and explain why their reunion matters before either one leaves tonight.'
+        generator = Mock(side_effect=[
+            json.dumps({'turns': [{'speaker': 'Mina', 'text': private_draft}]}),
+            json.dumps({'L1': private_draft}),
+            json.dumps({'L1': private_draft}),
+            json.dumps({'L1': private_draft}),
+        ])
+        with patch('builtins.print') as log:
+            with self.assertRaises(ValueError) as caught:
+                draft_spoken_exchange(prompt, 5.17, generator, language='English')
+
+        message = str(caught.exception)
+        self.assertTrue(message.startswith('The AI could not complete the requested dialogue.'))
+        self.assertIsInstance(caught.exception.__cause__, ValueError)
+        self.assertIn('Your exchange had 16 words; at most 15 allowed (aim for 12).', str(caught.exception.__cause__))
+        self.assertIn('Last validation reason: Your exchange had 16 words; at most 15 allowed (aim for 12).', message)
+        self.assertIn('Selected duration: 5.17 seconds.', message)
+        self.assertNotIn('aiming for 12..', message)
+        self.assertIn('increase the selected duration or shorten the dialogue', message)
+        self.assertEqual(generator.call_count, 4)
+        logged = '\n'.join(str(call.args[0]) for call in log.call_args_list)
+        self.assertEqual(log.call_count, 2)
+        self.assertIn('[Enhance dialogue] attempt 1/2 rejected: Your exchange had 16 words;', logged)
+        self.assertIn('[Enhance dialogue] attempt 2/2 rejected: Your exchange had 16 words;', logged)
+        self.assertNotIn(private_draft, logged)
+
+    def test_malformed_json_and_invalid_speaker_pair_keep_distinct_reasons(self):
+        invalid_outputs = (
+            ('not valid JSON', 'Expecting value'),
+            (json.dumps({'turns': [{'speaker': '', 'text': 'I kept the letter.'}]}),
+             'Return nonempty speaker/text pairs, without speech tags or newlines.'),
+        )
+        messages = []
+        for output, reason in invalid_outputs:
+            with self.subTest(output=output[:30]):
+                generator = Mock(return_value=output)
+                with patch('builtins.print'):
+                    with self.assertRaises(ValueError) as caught:
+                        draft_spoken_exchange(
+                            'Mina and Theo discuss the missing letter.', 5.17, generator, language='English'
+                        )
+                messages.append(str(caught.exception))
+                self.assertIn(f'Last validation reason: {reason}', messages[-1])
+                self.assertEqual(generator.call_count, 2)
+        self.assertNotEqual(messages[0], messages[1])
+
+    def test_validation_retry_can_repair_a_draft_on_second_attempt(self):
+        prompt = 'Mina and Theo discuss the missing letter. Use at least 11 spoken words.'
+        generator = Mock(side_effect=[
+            json.dumps({'turns': [{'speaker': 'Mina', 'text': 'I never mailed it.'}]}),
+            json.dumps({'turns': [{'speaker': 'Mina', 'text': 'Because I feared your answer, I kept the letter hidden for far too long.'}]}),
+        ])
+        with patch('builtins.print') as log:
+            result = draft_spoken_exchange(prompt, 5.17, generator, language='English')
+
+        self.assertIn('<d>[English] Because I feared your answer, I kept the letter hidden for far too long.</d>', result)
+        self.assertEqual(generator.call_count, 2)
+        self.assertEqual(log.call_count, 1)
+        self.assertIn('attempt 1/2 rejected:', log.call_args.args[0])
+
+    def test_generator_cancellation_and_runtime_errors_propagate_without_retry(self):
+        prompt = 'Mina and Theo discuss the missing letter.'
+        overlong = json.dumps({'turns': [{'speaker': 'Mina', 'text': 'letter ' * 100}]})
+        for error in (
+            ValueError('writer rejected request'),
+            KeyError('writer argument missing'),
+            TypeError('writer argument invalid'),
+            InterruptedError('cancelled'),
+            RuntimeError('writer unavailable'),
+        ):
+            with self.subTest(error=type(error).__name__, call='authoring'):
+                generator = Mock(side_effect=error)
+                with self.assertRaises(type(error)) as caught:
+                    draft_spoken_exchange(prompt, 5.17, generator, language='English')
+                self.assertIs(caught.exception, error)
+                generator.assert_called_once()
+
+            with self.subTest(error=type(error).__name__, call='copyedit'):
+                generator = Mock(side_effect=[overlong, error])
+                with self.assertRaises(type(error)) as caught:
+                    draft_spoken_exchange(prompt, 5.17, generator, language='English')
+                self.assertIs(caught.exception, error)
+                self.assertEqual(generator.call_count, 2)
+                self.assertFalse(caller_sampling_enabled())
+
+    def test_focused_copyedit_writer_errors_propagate_from_third_call(self):
+        prompt = "Nora, Kai, and Mina discuss the difficult holiday launch."
+        draft = [
+            {"speaker": "Kai", "text": "We nearly missed launch, but everyone kept moving when the schedule slipped badly twice."},
+            {"speaker": "Mina", "text": "I fixed the payment bug after Nora spotted how our holiday orders doubled overnight."},
+            {"speaker": "Nora", "text": "I want everyone back next year; let's make our launch easier from day one."},
+        ]
+        overlong_copyedit = {
+            "L1": "We nearly missed launch, but everyone kept moving when the schedule slipped badly twice.",
+            "L2": "I fixed the payment bug after Nora spotted how our holiday orders doubled overnight.",
+            "L3": "I want everyone back next year; let's make our launch easier from day one.",
+        }
+        first_draft = json.dumps({"turns": draft})
+        first_edit = json.dumps(overlong_copyedit)
+        for error in (
+            ValueError("provider rejected request"),
+            RuntimeError("provider unavailable"),
+            InterruptedError("cancelled"),
+        ):
+            with self.subTest(error=type(error).__name__):
+                observed_sampling = []
+
+                def generate(**kwargs):
+                    observed_sampling.append(caller_sampling_enabled())
+                    if len(observed_sampling) == 1:
+                        return first_draft
+                    if len(observed_sampling) == 2:
+                        return first_edit
+                    raise error
+
+                with self.assertRaises(type(error)) as caught:
+                    draft_spoken_exchange(prompt, 10.125, generate, language="English")
+                self.assertIs(caught.exception, error)
+                self.assertEqual(observed_sampling, [False, True, True])
+                self.assertFalse(caller_sampling_enabled())
+
+    def test_overlong_three_speaker_exchange_uses_two_measured_focus_passes(self):
+        prompt = (
+            "Nora, Kai, and Mina have exactly three turns about a difficult holiday launch: "
+            "Kai explains the delay, Mina found the payment bug, and Nora invites the team back."
+        )
+        draft = [
+            {"speaker": "Kai", "text": "We nearly missed launch when our holiday schedule slipped, but the team kept moving."},
+            {"speaker": "Mina", "text": "I fixed the payment bug after Nora spotted our holiday orders doubling overnight again."},
+            {"speaker": "Nora", "text": "I want everyone back next year; let's plan sooner for a better launch together."},
+        ]
+        first_edit = {
+            "L1": "Launch nearly slipped, but the team kept moving through the delay.",
+            "L2": "I fixed payment bug after Nora spotted holiday orders doubling overnight.",
+            "L3": "Come back next year; let's plan much sooner for launch.",
+        }
+        first_focus = {
+            "L1": "Launch nearly slipped, but our whole team moved through holiday delays.",
+            "L2": "Nora caught a payment bug before holiday orders doubled overnight.",
+        }
+        final_focus = {
+            "L1": "We nearly missed launch.",
+            # Gemma may echo locked context keys; only L1 is requested here.
+            "L2": first_focus["L2"],
+            "L3": first_edit["L3"],
+        }
+        self.assertEqual(sum(len(turn["text"].split()) for turn in draft), 42)
+        self.assertEqual(sum(len(text.split()) for text in first_edit.values()), 32)
+        self.assertEqual(sum(len(text.split()) for text in first_focus.values()) + len(first_edit["L3"].split()), 31)
+        calls = []
+        sampling_states = []
+
+        def generate(**kwargs):
+            calls.append(kwargs)
+            sampling_states.append(caller_sampling_enabled())
+            if len(calls) == 1:
+                return json.dumps({"turns": draft})
+            if len(calls) == 2:
+                return json.dumps(first_edit)
+            if len(calls) == 3:
+                return json.dumps(first_focus)
+            if len(calls) == 4:
+                return json.dumps(final_focus)
+            raise AssertionError("dialogue repair must not make more than four writer requests")
+
+        result = draft_spoken_exchange(prompt, 10.125, generate, language="English")
+
+        expected = [final_focus["L1"], first_focus["L2"], first_edit["L3"]]
+        self.assertEqual(llm_service._extract_h3_dialogue_blocks(result), expected)
+        self.assertEqual(sum(len(text.split()) for text in expected), 24)
+        self.assertIn("Kai (S1)", result)
+        self.assertIn("Mina (S2)", result)
+        self.assertIn("Nora (S3)", result)
+        self.assertLess(result.index("Kai (S1)"), result.index("Mina (S2)"))
+        self.assertLess(result.index("Mina (S2)"), result.index("Nora (S3)"))
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(sampling_states, [False, True, True, True])
+        self.assertTrue(calls[1]["system_prompt"].startswith("Copyedit the supplied spoken exchange"))
+        self.assertIn("Return only a JSON object mapping each supplied L-key", calls[1]["system_prompt"])
+        self.assertEqual(calls[1]["json_schema"]["required"], ["L1", "L2", "L3"])
+        self.assertFalse(calls[1]["enable_thinking"])
+        self.assertEqual(calls[1]["thinking_budget"], 0)
+        self.assertIsNone(calls[1]["reasoning_effort"])
+        self.assertEqual(calls[1]["max_new_tokens"], 768)
+        first_focus_prompt = calls[2]["prompt"]
+        self.assertIn("previous_words=32", first_focus_prompt)
+        self.assertIn("needed_reduction_words=8", first_focus_prompt)
+        self.assertIn('"current_words": 11', first_focus_prompt)
+        self.assertIsNone(calls[2]["json_schema"])
+        self.assertTrue(calls[2]["enable_thinking"])
+        self.assertEqual(calls[2]["thinking_budget"], 2048)
+        self.assertEqual(calls[2]["reasoning_effort"], "low")
+        self.assertEqual(calls[2]["max_new_tokens"], 768)
+        second_focus_prompt = calls[3]["prompt"]
+        self.assertIn("previous_words=31", second_focus_prompt)
+        self.assertIn("needed_reduction_words=7", second_focus_prompt)
+        self.assertIn("target_words=24", second_focus_prompt)
+        self.assertIn('"current_words": 11', second_focus_prompt)
+        self.assertIn('"maximum_words": 10', second_focus_prompt)
+        self.assertIsNone(calls[3]["json_schema"])
+        self.assertTrue(calls[3]["enable_thinking"])
+        self.assertEqual(calls[3]["thinking_budget"], 2048)
+        self.assertEqual(calls[3]["reasoning_effort"], "low")
+        self.assertEqual(calls[3]["max_new_tokens"], 768)
+        self.assertFalse(caller_sampling_enabled())
+
+    def test_fourth_writer_call_errors_and_cancellation_propagate_and_reset_sampling(self):
+        prompt = "Nora, Kai, and Mina discuss the difficult holiday launch."
+        draft = [
+            {"speaker": "Kai", "text": "We nearly missed launch when our holiday schedule slipped, but the team kept moving."},
+            {"speaker": "Mina", "text": "I fixed the payment bug after Nora spotted our holiday orders doubling overnight again."},
+            {"speaker": "Nora", "text": "I want everyone back next year; let's plan sooner for a better launch together."},
+        ]
+        first_edit = {
+            "L1": "Launch nearly slipped, but the team kept moving through the delay.",
+            "L2": "I fixed payment bug after Nora spotted holiday orders doubling overnight.",
+            "L3": "Come back next year; let's plan much sooner for launch.",
+        }
+        first_focus = {
+            "L1": "Launch nearly slipped, but our whole team moved through holiday delays.",
+            "L2": "Nora caught a payment bug before holiday orders doubled overnight.",
+        }
+        for error in (ValueError("provider rejected request"), RuntimeError("provider unavailable"),
+                      InterruptedError("cancelled")):
+            with self.subTest(error=type(error).__name__):
+                sampling_states = []
+                calls = []
+
+                def generate(**kwargs):
+                    calls.append(kwargs)
+                    sampling_states.append(caller_sampling_enabled())
+                    if len(calls) == 1:
+                        return json.dumps({"turns": draft})
+                    if len(calls) == 2:
+                        return json.dumps(first_edit)
+                    if len(calls) == 3:
+                        return json.dumps(first_focus)
+                    raise error
+
+                with self.assertRaises(type(error)) as caught:
+                    draft_spoken_exchange(prompt, 10.125, generate, language="English")
+                self.assertIs(caught.exception, error)
+                self.assertEqual(sampling_states, [False, True, True, True])
+                self.assertEqual(len(calls), 4)
+                self.assertFalse(caller_sampling_enabled())
+
+    def test_focused_copyedit_still_rejects_invalid_text_and_under_minimum_results(self):
+        prompt = "Nora, Kai, and Mina discuss the holiday launch. Include at least 22 spoken words."
+        draft = [
+            {"speaker": "Kai", "text": "We nearly missed launch when our holiday schedule slipped, but the team kept moving."},
+            {"speaker": "Mina", "text": "I fixed the payment bug after Nora spotted our holiday orders doubling overnight again."},
+            {"speaker": "Nora", "text": "I want everyone back next year; let's plan sooner for a better launch together."},
+        ]
+        overlong_edit = {
+            "L1": "Launch nearly slipped, but the team kept moving through the delay.",
+            "L2": "I fixed payment bug after Nora spotted holiday orders doubling overnight.",
+            "L3": "Come back next year; let's plan much sooner for launch.",
+        }
+        invalid_focus_edits = (
+            {"L1": "The team stayed strong.\nThe schedule slipped.",
+             "L2": "Nora caught it before our holiday sales."},
+            {"L1": "<d>[English] We stayed together.</d>",
+             "L2": "Nora caught it before our holiday sales."},
+            {"L1": "We stayed together.", "L2": "Nora caught it before holiday sales."},
+        )
+        for focus in invalid_focus_edits:
+            with self.subTest(focus=focus):
+                generator = Mock(side_effect=[
+                    json.dumps({"turns": draft}), json.dumps(overlong_edit), json.dumps(focus),
+                ])
+                with patch("builtins.print"):
+                    with self.assertRaisesRegex(ValueError, "could not complete the requested dialogue"):
+                        draft_spoken_exchange(prompt, 10.125, generator, language="English")
+                self.assertEqual(generator.call_count, 3)
+                self.assertFalse(caller_sampling_enabled())
+
+    def test_explicit_turn_count_does_not_relax_a_developed_conversation(self):
+        prompt = (
+            'Mina and Theo have a developed four-turn conversation about the missing letter. '
+            'Include at least 31 spoken words.'
+        )
+        short = {'turns': [
+            {'speaker': 'Mina', 'text': 'Where is it?'},
+            {'speaker': 'Theo', 'text': 'I looked.'},
+            {'speaker': 'Mina', 'text': 'Look again.'},
+            {'speaker': 'Theo', 'text': 'All right.'},
+        ]}
+        generator = Mock(return_value=json.dumps(short))
+        with self.assertRaisesRegex(ValueError, 'could not complete the requested dialogue'):
+            draft_spoken_exchange(prompt, 14.375, generator, language='English')
+        self.assertEqual(generator.call_count, 2)
+        self.assertIn('user-requested minimum 31 spoken words is strict', generator.call_args.kwargs['prompt'])
+
+    def test_visual_interaction_and_camera_instructions_do_not_request_speech(self):
+        examples = [CONCEPT,
+            'White-Clothed Martial Monk attacks Deep Brown-Clothed Martial Monk. The camera explains the force.',
+            'Two people wearing badges reading "Hello" and "How are you?" fight.',
+            (Path(__file__).parent / 'fixtures/h3_silent_temple_prompt.txt').read_text(encoding='utf-8')]
+        for prompt in examples:
+            with self.subTest(prompt=prompt[:70]):
+                self.assertFalse(adaptive_dialogue_expected(prompt))
+
+    def test_actual_conversation_requests_and_exact_lines_remain_speech(self):
+        for prompt in ['Mina and Theo discuss the letter.', 'Two friends have an affectionate conversation.',
+                       'Mae says, "Keep this safe." Jules replies, "I promise."']:
+            with self.subTest(prompt=prompt):
+                self.assertTrue(adaptive_dialogue_expected(prompt))
+        self.assertFalse(adaptive_dialogue_expected('Two friends argue through gestures. No dialogue.'))
+        self.assertFalse(adaptive_dialogue_expected('Two fighters circle. No cuts, slow motion, dialogue, or magic.'))
+
+    def test_descriptive_and_quantified_global_silence_skip_exchange_generation(self):
+        prompts = (
+            'A silent live-action martial-arts scene.',
+            'Two rivals settle the dispute through gestures. No one speaks or mouths words.',
+            'Two rivals settle the dispute through gestures. Nobody talks.',
+            'A jogger catches a stroller. No baby, dialogue, collision, impossible speed, cuts, or extra rescuer.',
+            'A jogger catches a stroller. No baby, collision, speech, cuts, or extra rescuer.',
+            'A jogger catches a stroller. No baby, dialogue.',
+            'A jogger catches a stroller. No baby, collision, or speech.',
+            'Nobody talks during the entire scene.',
+            'During the whole scene, no one speaks.',
+            'During the entire film, nobody talks.',
+        )
+        generator = Mock()
+        for prompt in prompts:
+            with self.subTest(prompt=prompt):
+                self.assertTrue(dialogue_forbidden(prompt))
+                self.assertFalse(adaptive_dialogue_expected(prompt))
+                self.assertEqual(
+                    draft_spoken_exchange(prompt, 14.375, generator, language='English'),
+                    prompt,
+                )
+        generator.assert_not_called()
+
+    def test_shared_no_list_does_not_erase_positive_or_quoted_dialogue(self):
+        prompts = (
+            'No baby cries, and dialogue begins after the rescue.',
+            'Mara says, "No baby, dialogue, collision, or cuts." Dev answers her.',
+            'No music plays while she delivers dialogue, then she leaves.',
+            'No subtitles are shown as two friends give a speech, then bow.',
+            'No music, but keep the dialogue, with one short reply.',
+            'No hesitation as she starts talking, then laughs.',
+        )
+        for prompt in prompts:
+            with self.subTest(prompt=prompt):
+                self.assertFalse(dialogue_forbidden(prompt))
+                self.assertTrue(adaptive_dialogue_expected(prompt))
+
+    def test_local_silence_before_requested_speech_is_not_global(self):
+        prompts = (
+            'No one speaks until Mara asks Dev whether the door is locked.',
+            'For the opening beat, nobody speaks. Then Mara asks Dev whether the door is locked.',
+            'During the fight, no one speaks. After it ends, Mara asks Dev a question.',
+        )
+        for prompt in prompts:
+            with self.subTest(prompt=prompt):
+                self.assertFalse(dialogue_forbidden(prompt))
+                self.assertTrue(adaptive_dialogue_expected(prompt))
+
+    def test_quoted_speech_is_local_but_quoted_prompt_keeps_global_silence(self):
+        spoken = (
+            'Mara says, "No one speaks here." Dev replies that she is mistaken.',
+            'Mara says, “Nobody talks during rehearsal.” Dev answers her.',
+        )
+        for prompt in spoken:
+            with self.subTest(prompt=prompt):
+                self.assertFalse(dialogue_forbidden(prompt))
+                self.assertTrue(adaptive_dialogue_expected(prompt))
+        wrapped_prompts = (
+            '"A silent live-action martial-arts scene."',
+            '“Two fighters circle. No one speaks or mouths words.”',
+            'Prompt: "No one speaks."',
+        )
+        for prompt in wrapped_prompts:
+            with self.subTest(prompt=prompt):
+                self.assertTrue(dialogue_forbidden(prompt))
+                self.assertFalse(adaptive_dialogue_expected(prompt))
+
+    def test_conversation_does_not_need_canned_silence_phrases(self):
+        source = 'Mina and Theo discuss the letter.'
+        draft = 'Mina (S1) asks <d>[English] Why did you never write back?</d> Theo (S2) answers <d>[English] I was afraid.</d>'
+        self.assertTrue(llm_service._h3_speech_timing_satisfied(source, draft, 14.375, 'adaptive'))
+        self.assertFalse(llm_service._h3_speech_timing_satisfied(source, draft, 2, 'adaptive'))
+        self.assertFalse(llm_service._h3_speech_timing_satisfied('A duel. No dialogue.', draft, 14.375, 'adaptive'))
+
+    def test_dialogue_budget_revision_keeps_cameras_actions_and_exact_lines(self):
+        source = 'Mina says, "Stay." Theo explains why he left. They discuss a new beginning.'
+        draft = 'Camera follows Mina beside the train. Mina (S1): <d>[English] Stay.</d> Theo (S2): <d>[English] Sorry.</d> They hold hands.'
+        revised = 'I thought leaving would make things easier for us. It did not. I should have answered your letter instead of hiding. Could we try again, starting with an honest conversation?'
+        generator = Mock(return_value=json.dumps({'lines': ['Stay.', revised]}))
+        result = llm_service._fit_adaptive_dialogue(source, draft, 14.375, generator)
+        self.assertEqual(result, draft.replace('Sorry.', revised))
+        generator.assert_called_once()
+        self.assertIn('json_schema', generator.call_args.kwargs)
+
+    def test_adaptive_context_does_not_wrap_source_in_creative_story_scaffolding(self):
+        context = llm_service._build_enhance_user_prompt(CONCEPT, 'video', 14.375, 1, 14.375,
+            model_type='minimax_h3_ref2va', planning_style='adaptive')
+        self.assertNotIn('[CREATIVE', context)
+        self.assertIn('No spoken exchange', context)
+        self.assertTrue(context.endswith(CONCEPT))
+
+    def test_scene_craft_is_selected_without_adding_a_style_choice(self):
+        action = adaptive_writing_guide(CONCEPT)
+        self.assertIn('preparation', action.lower())
+        self.assertNotEqual(action, adaptive_writing_guide('A still product on a desk.'))
+
+    def test_writing_instruction_is_not_an_event(self):
+        events = extract_source_events('Two fighters clash beside a pillar. Then write the shot-for-shot choreography.')
+        self.assertTrue(events)
+        self.assertNotIn('shot-for-shot', str(events))
+        source = 'Two martial artists fight. No cuts, slow motion, dialogue, or magic. The agile fighter dodges a punch.'
+        self.assertNotIn('No cuts', str(extract_source_events(source)))
+        self.assertNotIn('Two', extract_h3_source_intent(source)['cast_names'])
+        self.assertIn('Eleven', extract_h3_source_intent('Eleven fights the monster.')['cast_names'])
+
+    def test_causal_consequence_stays_with_its_strike_and_negated_pacing_stays_real_time(self):
+        source = 'The agile fighter dodges a heavy punch; it cracks a stone pillar behind him.'
+        events = extract_source_events(source)
+        self.assertEqual(len(events), 1)
+        self.assertIn('dodges', events[0]['text'])
+        self.assertIn('cracks a stone pillar', events[0]['text'])
+        intent = extract_h3_source_intent(source + ' No cuts, slow motion, dialogue, or magic.')
+        self.assertNotIn('preserve slow-motion', intent['pacing_contract'])
+
+    def test_ref2va_compilation_keeps_complete_camera_and_sound_phrases(self):
+        from services.h3_sequence_planner import compile_h3_reference_sequence_prompts, compute_h3_sequence_clips
+        clips, _ = compute_h3_sequence_clips(226)
+        camera = ('The camera follows the two fighters along the edge of the courtyard, '
+                  'keeping both bodies in the same wide frame while moving past the established pillar '
+                  'to reveal the new fracture and the open escape route.')
+        music = ('A low cello drone builds beneath the exchange, changes to a descending phrase '
+                 'when the pillar cracks, and resolves into a single sustained note as they separate.')
+        shots = [{'shot': index + 1, 'start_seconds': start, 'end_seconds': end,
+                  'transition': 'opening composition' if not index else 'continuous reframe',
+                  'framing': 'wide master', 'camera': camera, 'action': action,
+                  'sound_effects': 'A sharp crack of stone.', 'dialogue': []}
+                 for index, (start, end, action) in enumerate([
+                     (0, 4, 'The missed punch cracks the pillar.'),
+                     (4, clips[0]['duration_seconds'], 'Both fighters circle beside the damage.')])]
+        plan = {'subject_definitions': 'Two fighters.', 'visual_style': camera,
+                'music': music, 'clips': [{'shots': shots, 'opening_state': 'They stand beside the pillar.',
+                                         'closing_state': 'They circle beside the fracture.'}]}
+        prompt = compile_h3_reference_sequence_prompts(plan, clips, reference_relationships='',
+                 default_retention='', task_types='reference generation')[0]['prompt']
+        self.assertIn(camera.rstrip('.'), prompt)
+        self.assertIn(music, prompt)
+        self.assertIn('without a cut', prompt)
+        self.assertNotIn('[Shot 2]', prompt)
+
+    def test_source_event_ownership_does_not_erase_developed_prose(self):
+        canonical = _deterministic_ledger(CONCEPT, segment_count=2, segment_durations=[14, 14],
+            locked_dialogue=[], camera_coverage='multi_shot', reference_context='')
+        candidate = deepcopy(canonical)
+        candidate['beats'] = [
+            {'segment': 1, 'source_event_ids': ['E1'], 'description': 'The gray-robed boxer plants his foot and drives a fist toward the kicker, who pivots beside the established stone wall.',
+             'state_after': 'The kicker is beside the wall.', 'dialogue_ids': []},
+            {'segment': 2, 'source_event_ids': ['E1'], 'description': 'The kicker rebounds off that wall; his heel meets the boxer’s block and both skid apart through dust.',
+             'state_after': 'Both stand apart on the damaged terrace.', 'dialogue_ids': []}]
+        result = _canonicalize_story_ledger(CONCEPT, canonical, candidate, locked_dialogue=[],
+            segment_count=2, preserve_adaptation=True)
+        self.assertEqual([b['description'] for b in result['beats']], [b['description'] for b in candidate['beats']])
+        self.assertEqual([b['source_event_ids'] for b in result['beats']], [['E1'], []])
+        # Legacy schedules still recover source wording.
+        legacy = _canonicalize_story_ledger(CONCEPT, canonical, candidate, locked_dialogue=[], segment_count=2)
+        self.assertEqual(legacy['beats'][0]['description'], CONCEPT)
+
+    def test_camera_handoff_keeps_adapted_aftermath_as_context_and_grounded_actions(self):
+        from services.h3_story_ledger import _camera_phase_beats
+        beat = {'beat_id': 'B2', 'description': 'The agile fighter completes his evasive step as both circle the damaged pillar.',
+                'state_after': 'Both circle beside the fracture.', 'source_event_ids': ['E2', 'E3'], 'dialogue_ids': []}
+        events = [{'event_id': 'E2', 'text': 'A punch misses and cracks the pillar.'},
+                  {'event_id': 'E3', 'text': 'Both circle beside it.'}]
+        adaptive = _camera_phase_beats([beat], source_events=events, expected_dialogue_events={}, preserve_adaptation=True)
+        self.assertEqual(len(adaptive), 1)
+        grouped = adaptive[0]
+        self.assertEqual(grouped['_grouped_source_event_ids'], ['E2', 'E3'])
+        self.assertEqual(grouped['source_event_ids'], ['E2', 'E3'])
+        self.assertEqual(grouped['state_after'], beat['state_after'])
+        self.assertIn('evasive step', grouped['_staging_context'])
+        self.assertNotIn('evasive step', grouped['_canonical_action'])
+        self.assertLess(
+            grouped['_canonical_action'].index('punch misses'),
+            grouped['_canonical_action'].index('Both circle'),
+        )
+        legacy = _camera_phase_beats([beat], source_events=events, expected_dialogue_events={})
+        self.assertEqual(len(legacy), 2)
+
+    def test_no_media_keeps_prompt_native_cast_and_rejects_phantom_audio(self):
+        context = 'No reference media were supplied.'
+        draft = ('subject_definitions: Gray wears gray robes; Gold wears gold robes.\n'
+            'summary: A mountain duel.\nretention_analysis: N/A\n'
+            'detailed_description: Gray blocks Gold’s kick.\noverall_soundscape: A sharp thud.\nnon_diegetic_music: N/A')
+        compiled = llm_service._canonicalize_h3_ref2va_reference_fields(draft, context, CONCEPT)
+        self.assertIn('Gray wears gray robes', compiled)
+        self.assertTrue(llm_service._h3_ref2va_reference_contract_satisfied(compiled, context))
+        for token in ['<Subject 1>', '<Picture 1>', '<Audio 1>']:
+            self.assertFalse(llm_service._h3_ref2va_reference_contract_satisfied(compiled + token, context))
+
+    def test_visual_reference_does_not_imply_a_voice_reference(self):
+        context = '<Subject 1> is Mae from <Picture 1>, preserving identity.'
+        draft = llm_service._build_h3_ref2va_tagged_fallback('Mae walks.', context, duration_seconds=5)
+        self.assertTrue(llm_service._h3_ref2va_reference_contract_satisfied(draft, context))
+        self.assertFalse(llm_service._h3_ref2va_reference_contract_satisfied(draft + ' Voice from <Audio 1>.', context))
+
+
+if __name__ == '__main__':
+    unittest.main()

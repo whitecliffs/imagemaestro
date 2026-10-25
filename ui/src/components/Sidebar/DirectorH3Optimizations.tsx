@@ -1,0 +1,464 @@
+import { useEffect, useState } from 'react'
+import { Gauge, Layers, Zap } from 'lucide-react'
+import { fetchModelOptions } from '../../api/client'
+import { DEFAULT_DIRECTOR_VIDEO_MODEL, useStore } from '../../stores/useStore'
+import type { ModelOptions } from '../../types'
+import { InfoTooltip } from './InfoTooltip'
+import { directorH3SlaEnabled, directorH3VedaEnabled } from '../../lib/h3Attention'
+
+/**
+ * Director-owned MiniMax H3 optimization controls.
+ *
+ * Director intentionally keeps these values separate from Studio: changing a
+ * speed recipe here must affect newly generated Director shots, Dashboard
+ * repair, and regeneration without silently changing Studio's active model.
+ */
+export function DirectorH3Optimizations() {
+  const videoModel = useStore(s => s.selectedModelPerMode.video || DEFAULT_DIRECTOR_VIDEO_MODEL)
+  const videoStepsByModel = useStore(s => s.directorVideoInferenceStepsByModel)
+  const setVideoSteps = useStore(s => s.setDirectorVideoInferenceSteps)
+  const turboModeByModel = useStore(s => s.directorH3TurboModeByModel)
+  const setTurboMode = useStore(s => s.setDirectorH3TurboMode)
+  const turboPresetByModel = useStore(s => s.directorH3TurboPresetByModel)
+  const setTurboPreset = useStore(s => s.setDirectorH3TurboPreset)
+  const solModeByModel = useStore(s => s.directorH3SolModeByModel)
+  const setSolMode = useStore(s => s.setDirectorH3SolMode)
+  const slaModeByModel = useStore(s => s.directorH3SlaModeByModel)
+  const setSlaMode = useStore(s => s.setDirectorH3SlaMode)
+  const vedaModeByModel = useStore(s => s.directorH3VedaModeByModel)
+  const setVedaMode = useStore(s => s.setDirectorH3VedaMode)
+  const firstBlockCacheByModel = useStore(s => s.directorH3FirstBlockCacheByModel)
+  const setFirstBlockCache = useStore(s => s.setDirectorH3FirstBlockCache)
+  const cacheMultiplierByModel = useStore(s => s.directorH3FirstBlockCacheMultiplierByModel)
+  const setCacheMultiplier = useStore(s => s.setDirectorH3FirstBlockCacheMultiplier)
+  const cacheWarmupByModel = useStore(s => s.directorH3FirstBlockCacheWarmupByModel)
+  const setCacheWarmup = useStore(s => s.setDirectorH3FirstBlockCacheWarmup)
+  const savedVideoLoras = useStore(s => s.savedLoraPerMode.video)
+  const directorSetLora = useStore(s => s.directorSetLora)
+  const [loadedOptions, setLoadedOptions] = useState<{
+    model: string
+    options: ModelOptions | null
+  }>({ model: '', options: null })
+  const modelOptions = loadedOptions.model === videoModel ? loadedOptions.options : null
+
+  useEffect(() => {
+    let cancelled = false
+    fetchModelOptions(videoModel)
+      .then(options => {
+        if (cancelled) return
+        setLoadedOptions({ model: videoModel, options })
+        useStore.getState().initializeDirectorH3Turbo(videoModel, options)
+        const defaultSteps = options.default_num_inference_steps
+        if (defaultSteps != null && Number.isFinite(defaultSteps)) {
+          const current = useStore.getState().directorVideoInferenceStepsByModel[videoModel]
+          if (current == null) setVideoSteps(videoModel, defaultSteps)
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setLoadedOptions({ model: videoModel, options: null })
+      })
+    return () => { cancelled = true }
+  }, [setVideoSteps, videoModel])
+
+  useEffect(() => {
+    if (loadedOptions.model !== videoModel || vedaModeByModel[videoModel] !== true) return
+    const options = loadedOptions.options
+    if (options?.veda_attention !== true || options.veda_attention_status?.supported !== true) {
+      setVedaMode(videoModel, false)
+    }
+  }, [loadedOptions, setVedaMode, vedaModeByModel, videoModel])
+
+  const isH3 = String(modelOptions?.architecture || '').startsWith('minimax_h3')
+  if (!isH3) return null
+
+  const turboOption = modelOptions?.minimax_h3_turbo
+  const turboPresets = turboOption?.presets?.length
+    ? turboOption.presets
+    : turboOption
+      ? [{
+          id: turboOption.preset_id,
+          label: turboOption.version_label,
+          status: 'validated',
+          filename: turboOption.filename,
+          steps: turboOption.steps,
+          weight: turboOption.weight,
+          weight_min: 0.5,
+          weight_max: 1.0,
+          description: turboOption.guide,
+          revision: '',
+        }]
+      : []
+  const turboRequested = turboModeByModel[videoModel] === true
+  const defaultTurboPreset = (
+    turboPresets.find(preset => preset.id === turboOption?.preset_id)
+    || turboPresets[0]
+  )
+  const configuredTurboPreset = turboPresets.find(
+    preset => preset.id === turboPresetByModel[videoModel],
+  )
+  const selectedTurboPreset = turboRequested
+    ? (configuredTurboPreset || defaultTurboPreset)
+    : defaultTurboPreset
+  const turboSelected = Boolean(
+    turboOption && selectedTurboPreset
+    && turboRequested
+    && savedVideoLoras?.activated_loras?.includes(selectedTurboPreset.filename)
+  )
+  const solStatus = modelOptions?.sol_attention_status
+  const vedaSelected = directorH3VedaEnabled(modelOptions, videoModel, vedaModeByModel)
+  const slaSelected = !vedaSelected && directorH3SlaEnabled(modelOptions, videoModel, slaModeByModel, solModeByModel)
+  const slaExperimental = modelOptions?.sla_attention_experimental === true
+  const solSelected = Boolean(
+    modelOptions?.sol_attention
+    && solStatus?.supported
+    && solModeByModel[videoModel] === true
+    && !slaSelected
+    && !vedaSelected
+  )
+  const cacheSelected = Boolean(
+    modelOptions?.first_block_cache
+    && firstBlockCacheByModel[videoModel] === true
+  )
+  const slaStatus = modelOptions?.sla_attention_status
+  const vedaStatus = modelOptions?.veda_attention_status
+  const vedaExperimental = modelOptions?.veda_attention_experimental === true
+  const cacheMultiplierChoices = modelOptions?.skip_steps_multiplier_choices || []
+  const cacheMultiplier = (
+    cacheMultiplierByModel[videoModel]
+    ?? modelOptions?.default_skip_steps_multiplier
+    ?? 0.08
+  )
+  const cacheWarmup = (
+    cacheWarmupByModel[videoModel]
+    ?? modelOptions?.default_skip_steps_start_step_perc
+    ?? 25
+  )
+  const fusedTurbo = modelOptions?.minimax_h3_fused_turbo === true
+  const activeCount = [turboSelected, solSelected, slaSelected, vedaSelected, cacheSelected].filter(Boolean).length
+  const defaultSteps = modelOptions?.minimax_h3_turbo?.unaccelerated_steps
+    ?? modelOptions?.default_num_inference_steps
+  const currentSteps = videoStepsByModel[videoModel] ?? defaultSteps
+
+  const setDirectorTurbo = (checked: boolean) => {
+    if (!turboOption || !selectedTurboPreset) return
+    const current = savedVideoLoras || {
+      activated_loras: [],
+      loras_multipliers: '',
+      loraWeights: {},
+      availableLoras: [],
+    }
+    const managedTurboFiles = new Set(turboPresets.map(preset => preset.filename))
+    const nextLoras = current.activated_loras.filter(filename => !managedTurboFiles.has(filename))
+    const nextWeights = { ...current.loraWeights }
+    for (const filename of managedTurboFiles) delete nextWeights[filename]
+    if (checked) {
+      nextLoras.push(selectedTurboPreset.filename)
+      nextWeights[selectedTurboPreset.filename] = [selectedTurboPreset.weight]
+    }
+    const nextAvailable = current.availableLoras.includes(selectedTurboPreset.filename)
+      ? current.availableLoras
+      : [...current.availableLoras, selectedTurboPreset.filename]
+    const multipliers = nextLoras.map(filename => (
+      (nextWeights[filename] || [1]).map(value => value.toFixed(2)).join(';')
+    )).join(' ')
+    directorSetLora('video', nextLoras, multipliers, nextWeights, nextAvailable)
+    setTurboMode(videoModel, checked)
+    setTurboPreset(videoModel, selectedTurboPreset.id)
+    if (checked) {
+      setVideoSteps(videoModel, selectedTurboPreset.steps)
+    } else if (currentSteps === selectedTurboPreset.steps && defaultSteps != null) {
+      setVideoSteps(videoModel, defaultSteps)
+    }
+  }
+
+  const changeDirectorTurboPreset = (presetId: string) => {
+    const nextPreset = turboPresets.find(preset => preset.id === presetId)
+    if (!nextPreset) return
+    setTurboPreset(videoModel, nextPreset.id)
+    if (!turboSelected) return
+
+    const current = savedVideoLoras || {
+      activated_loras: [],
+      loras_multipliers: '',
+      loraWeights: {},
+      availableLoras: [],
+    }
+    const managedTurboFiles = new Set(turboPresets.map(preset => preset.filename))
+    const nextLoras = current.activated_loras.filter(filename => !managedTurboFiles.has(filename))
+    nextLoras.push(nextPreset.filename)
+    const nextWeights = { ...current.loraWeights }
+    for (const filename of managedTurboFiles) delete nextWeights[filename]
+    nextWeights[nextPreset.filename] = [nextPreset.weight]
+    const nextAvailable = current.availableLoras.includes(nextPreset.filename)
+      ? current.availableLoras
+      : [...current.availableLoras, nextPreset.filename]
+    const multipliers = nextLoras.map(filename => (
+      (nextWeights[filename] || [1]).map(value => value.toFixed(2)).join(';')
+    )).join(' ')
+    directorSetLora('video', nextLoras, multipliers, nextWeights, nextAvailable)
+    setVideoSteps(videoModel, nextPreset.steps)
+  }
+
+  return (
+    <section className="space-y-2">
+      <div className="flex items-center justify-between gap-2">
+        <div>
+          <div className="text-[11px] font-semibold uppercase tracking-wider text-text-secondary">
+            H3 Optimizations
+          </div>
+          <p className="mt-0.5 text-[9px] text-text-muted">
+            Applied to every new Director shot, repair, and regeneration.
+          </p>
+        </div>
+        {activeCount > 0 && (
+          <span className="rounded-full bg-accent-blue/15 px-2 py-0.5 text-[9px] font-medium text-accent-blue">
+            {activeCount} active
+          </span>
+        )}
+      </div>
+
+      {fusedTurbo && (
+        <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2.5">
+          <div className="flex items-start gap-2.5">
+            <Zap size={13} className="mt-0.5 shrink-0 text-indicator-warning" />
+            <span className="min-w-0">
+              <span className="block text-[11px] font-medium text-text-primary">
+                Fused Turbo Recipe
+              </span>
+              <span className="mt-0.5 block text-[9px] leading-relaxed text-text-muted">
+                Every Director shot uses the checkpoint's baked Turbo and Mystic recipe. Four steps is the default; Total Steps can be adjusted from 4-12 in Director Advanced. Compatible H3 LoRAs are experimental under Video LoRAs. Extra Turbo/PDD and VDN adapters and cache recipes remain disabled.
+              </span>
+            </span>
+          </div>
+        </div>
+      )}
+
+      {turboOption && (
+        <div className={`rounded-lg border px-3 py-2.5 ${
+          turboSelected
+            ? 'border-accent-blue/50 bg-accent-blue/10'
+            : 'border-border bg-bg-tertiary/50'
+        }`}>
+          <label className="flex cursor-pointer items-center gap-2.5">
+            <input
+              type="checkbox"
+              checked={turboSelected}
+              onChange={event => setDirectorTurbo(event.target.checked)}
+              className="accent-accent-blue"
+            />
+            <Zap size={13} className={turboSelected ? 'text-accent-blue' : 'text-text-muted'} />
+            <span className="min-w-0 flex-1">
+              <span className="block text-[11px] font-medium text-text-primary">Turbo</span>
+              <span className="block text-[9px] text-text-muted">
+                {selectedTurboPreset?.steps ?? turboOption.steps}-step managed LoRA
+              </span>
+            </span>
+            <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[8px] font-medium uppercase tracking-wider text-indicator-warning">
+              Experimental
+            </span>
+            <InfoTooltip
+              label="About Director H3 Turbo"
+              text={selectedTurboPreset?.description || turboOption.guide}
+            />
+          </label>
+          {turboPresets.length > 1 && (
+            <select
+              value={selectedTurboPreset?.id || ''}
+              onChange={event => changeDirectorTurboPreset(event.target.value)}
+              className="mt-2 w-full rounded border border-border bg-bg-secondary px-2 py-1.5 text-[10px] text-text-primary focus:border-accent-blue focus:outline-none"
+              aria-label="Director H3 Turbo preset"
+            >
+              {turboPresets.map(preset => (
+                <option key={preset.id} value={preset.id}>{preset.label}</option>
+              ))}
+            </select>
+          )}
+          {turboSelected && selectedTurboPreset && (
+            <p className="mt-1.5 text-[9px] text-text-muted">
+              Starts at {selectedTurboPreset.weight.toFixed(2)} strength. Adjust it under Director Video LoRAs.
+            </p>
+          )}
+        </div>
+      )}
+
+      {modelOptions?.sol_attention && (
+        <div className={`rounded-lg border px-3 py-2.5 ${
+          solSelected
+            ? 'border-accent-blue/50 bg-accent-blue/10'
+            : 'border-border bg-bg-tertiary/50'
+        }`}>
+          <label className={`flex items-center gap-2.5 ${
+            solStatus?.supported ? 'cursor-pointer' : 'cursor-not-allowed opacity-70'
+          }`}>
+            <input
+              type="checkbox"
+              checked={solSelected}
+              disabled={!solStatus?.supported}
+              onChange={event => setSolMode(videoModel, event.target.checked)}
+              className="accent-accent-blue"
+            />
+            <Gauge size={13} className={solSelected ? 'text-accent-blue' : 'text-text-muted'} />
+            <span className="min-w-0 flex-1">
+              <span className="block text-[11px] font-medium text-text-primary">Sol Engine</span>
+              <span className="block text-[9px] text-text-muted">
+                {solStatus?.supported ? 'H3 sparse attention' : 'Unavailable in this runtime'}
+              </span>
+            </span>
+            <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[8px] font-medium uppercase tracking-wider text-indicator-warning">
+              Experimental
+            </span>
+            <InfoTooltip
+              label="About Director H3 Sol Engine"
+              text={solStatus?.supported
+                ? 'Uses H3-aware sparse attention for every newly generated Director shot. Unsupported calls fall back automatically.'
+                : solStatus?.reason || 'Sol Engine is unavailable in this runtime.'}
+            />
+          </label>
+        </div>
+      )}
+
+      {modelOptions?.sla_attention && (
+        <div className={`rounded-lg border px-3 py-2.5 ${
+          slaSelected
+            ? 'border-accent-blue/50 bg-accent-blue/10'
+            : 'border-border bg-bg-tertiary/50'
+        }`}>
+          <label className="flex cursor-pointer items-center gap-2.5">
+            <input
+              type="checkbox"
+              checked={slaSelected}
+              onChange={event => setSlaMode(videoModel, event.target.checked)}
+              className="accent-accent-blue"
+            />
+            <Gauge size={13} className={slaSelected ? 'text-accent-blue' : 'text-text-muted'} />
+            <span className="min-w-0 flex-1">
+              <span className="block text-[11px] font-medium text-text-primary">
+                SLA Sparse Attention{slaExperimental ? ' — Experimental' : ''}
+              </span>
+              <span className="block text-[9px] text-text-muted">
+                {slaStatus?.supported
+                  ? slaExperimental ? 'Optional acceleration; compare motion and audio' : 'Published FastH3 sparse recipe'
+                  : 'Safe dense fallback when unavailable'}
+              </span>
+            </span>
+            <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[8px] font-medium uppercase tracking-wider text-indicator-warning">
+              Experimental
+            </span>
+            <InfoTooltip
+              label="About Director H3 SLA"
+              text={slaStatus?.supported
+                ? slaExperimental
+                  ? 'Uses 90% block-sparse attention for newly generated Full or Pruned H3 shots. Off by default; compare motion, reference fidelity and audio quality. The first use compiles Triton kernels; reference and audio prefix rows stay protected.'
+                  : 'Runs the fused checkpoint with its published 90% block-sparse SLA recipe. The first use compiles and caches Triton kernels.'
+                : `${slaStatus?.reason || 'SLA is unavailable in this runtime.'} Maestro will use dense attention without failing the generation.`}
+            />
+          </label>
+        </div>
+      )}
+
+      {modelOptions?.veda_attention === true && (
+        <div className={`rounded-lg border px-3 py-2.5 ${
+          vedaSelected
+            ? 'border-accent-blue/50 bg-accent-blue/10'
+            : 'border-border bg-bg-tertiary/50'
+        }`}>
+          <label className={`flex items-center gap-2.5 ${
+            vedaStatus?.supported ? 'cursor-pointer' : 'cursor-not-allowed opacity-70'
+          }`}>
+            <input
+              type="checkbox"
+              checked={vedaSelected}
+              disabled={!vedaStatus?.supported}
+              onChange={event => setVedaMode(videoModel, event.target.checked)}
+              className="accent-accent-blue"
+            />
+            <Gauge size={13} className={vedaSelected ? 'text-accent-blue' : 'text-text-muted'} />
+            <span className="min-w-0 flex-1">
+              <span className="block text-[11px] font-medium text-text-primary">
+                Veda Sparse Attention{vedaExperimental ? ' — Experimental' : ''}
+              </span>
+              <span className="block text-[9px] text-text-muted">
+                {vedaStatus?.supported
+                  ? 'First use downloads a predictor; compare quality'
+                  : vedaStatus?.reason || 'Unavailable in this runtime'}
+              </span>
+            </span>
+            <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[8px] font-medium uppercase tracking-wider text-indicator-warning">
+              Experimental
+            </span>
+            <InfoTooltip
+              label="About Director H3 Veda Sparse Attention"
+              text={vedaStatus?.supported
+                ? 'Uses the existing H3 model with a Veda predictor downloaded on first use (about 281 MB for INT8 ConvRot or 551 MB for BF16). Compare motion, reference fidelity, and audio quality on new Director shots.'
+                : `${vedaStatus?.reason || 'Veda is unavailable in this runtime.'} The toggle is disabled on unsupported hardware.`}
+            />
+          </label>
+        </div>
+      )}
+
+      {modelOptions?.first_block_cache && (
+        <div className={`rounded-lg border px-3 py-2.5 ${
+          cacheSelected
+            ? 'border-accent-blue/50 bg-accent-blue/10'
+            : 'border-border bg-bg-tertiary/50'
+        }`}>
+          <label className="flex cursor-pointer items-center gap-2.5">
+            <input
+              type="checkbox"
+              checked={cacheSelected}
+              onChange={event => setFirstBlockCache(videoModel, event.target.checked)}
+              className="accent-accent-blue"
+            />
+            <Layers size={13} className={cacheSelected ? 'text-accent-blue' : 'text-text-muted'} />
+            <span className="min-w-0 flex-1">
+              <span className="block text-[11px] font-medium text-text-primary">First Block Cache</span>
+              <span className="block text-[9px] text-text-muted">Reuse stable denoising work</span>
+            </span>
+            <InfoTooltip
+              label="About Director First Block Cache"
+              text="Reuses stable transformer work after warmup. It is most effective on longer, higher-step H3 runs and can be combined with Turbo and Sol Engine."
+            />
+          </label>
+          {cacheSelected && (
+            <div className="mt-2.5 space-y-2.5 border-t border-border/70 pt-2.5">
+              {cacheMultiplierChoices.length > 0 && (
+                <div className="flex items-center justify-between gap-2">
+                  <label className="text-[10px] text-text-muted">
+                    {modelOptions.skip_steps_multiplier_label || 'Change threshold'}
+                  </label>
+                  <select
+                    value={cacheMultiplier}
+                    onChange={event => setCacheMultiplier(videoModel, Number(event.target.value))}
+                    className="rounded border border-border bg-bg-secondary px-2 py-1 text-[10px] text-text-primary focus:border-accent-blue focus:outline-none"
+                  >
+                    {cacheMultiplierChoices.map(([label, value]) => (
+                      <option key={value} value={value}>{label}</option>
+                    ))}
+                  </select>
+                </div>
+              )}
+              <div>
+                <div className="mb-1 flex items-center justify-between">
+                  <label className="text-[10px] text-text-muted">Warmup</label>
+                  <span className="text-[10px] tabular-nums text-text-muted">{cacheWarmup}%</span>
+                </div>
+                <input
+                  type="range"
+                  min={0}
+                  max={75}
+                  step={5}
+                  value={cacheWarmup}
+                  onChange={event => setCacheWarmup(videoModel, Number(event.target.value))}
+                  className="w-full"
+                />
+              </div>
+              <p className="text-[9px] text-text-muted">
+                Higher thresholds reuse more work but can change motion or fine detail.
+              </p>
+            </div>
+          )}
+        </div>
+      )}
+    </section>
+  )
+}

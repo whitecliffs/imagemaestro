@@ -1,0 +1,96 @@
+# Base cross-platform requirements for Maestro (ImageMaestro)
+# Common dependencies across macOS (Apple Silicon), AMD (ROCm), NVIDIA (CUDA), and CPU
+
+# Core MMGP & HuggingFace utilities
+optimum-quanto>=0.2.4
+safetensors>=0.4.3
+psutil>=5.9.0
+
+# Core AI stack
+diffusers>=0.30.0,<=0.36.0
+transformers>=4.45.0,<=4.57.1
+tokenizers>=0.20.0,<=0.23.0
+accelerate>=0.34.0,<=1.12.0
+tqdm>=4.66.0
+imageio>=2.34.0
+imageio-ffmpeg>=0.5.1
+einops>=0.8.0
+sentencepiece>=0.2.0
+open_clip_torch>=2.24.0
+numpy>=1.26.0,<2.3.0
+num2words>=0.5.13
+
+# Video & Media
+moviepy>=1.0.3,<2.0.0
+av>=12.0.0
+ffmpeg-python>=0.2.0
+pygame>=2.5.0
+sounddevice>=0.4.6
+soundfile>=0.12.1
+mutagen>=1.47.0
+pyloudnorm>=0.2.0
+librosa>=0.10.2
+faster-whisper>=1.0.0
+openai-whisper>=20231117
+speechbrain>=1.0.0
+audio-separator>=0.20.0
+pyannote.audio>=3.1.0
+
+# UI & Interaction
+gradio>=5.0.0
+fastapi>=0.110.0
+uvicorn>=0.29.0
+pywebpush>=2.0.0
+dashscope>=1.20.0
+loguru>=0.7.0
+s3tokenizer>=0.1.0
+conformer>=0.3.2
+spacy_pkuseg>=0.0.33
+spacy>=3.7.0
+gradio_rangeslider>=0.0.8
+
+# Vision & Segmentation
+opencv-python>=4.9.0
+ultralytics>=8.2.0
+segment-anything>=1.0
+decord>=0.6.0; sys_platform != "darwin"
+timm>=1.0.0
+facexlib>=0.3.0
+vector-quantize-pytorch>=1.14.0
+
+# Config & Orchestration
+omegaconf>=2.3.0
+hydra-core>=1.3.2
+easydict>=1.13
+pydantic>=2.7.0
+
+# Math & Modeling
+torchdiffeq>=0.2.3
+tensordict>=0.4.0
+peft>=0.11.0
+matplotlib>=3.8.0
+gguf>=0.10.0
+
+# Text, NLP & Utilities
+ftfy>=6.2.0
+piexif>=1.1.3
+misaki>=0.8.0
+phonemizer-fork
+espeakng-loader
+pydub>=0.25.1
+gitdb>=4.0.10
+gitpython>=3.1.40
+stringzilla>=3.10.0
+xxhash>=3.4.0
+munch>=4.0.0
+wetext>=0.1.2
+json_repair>=0.25.0
+iopath>=0.1.10
+pycocotools>=2.0.7
+requests>=2.31.0
+aiohttp>=3.9.0
+websockets>=12.0
+aiofiles>=23.2.0
+
+# Required by the eagerly imported SCAIL pose pipeline
+smplfitter>=0.6.0

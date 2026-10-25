@@ -1,0 +1,11 @@
+# Unified ImageMaestro Requirements
+# Automatically adapts to macOS (Apple Silicon), AMD Linux (ROCm), NVIDIA, and CPU
+-r requirements-base.txt
+
+# Platform-specific ONNX runtime
+onnxruntime>=1.18.0; sys_platform == "darwin"
+onnxruntime>=1.18.0; sys_platform != "darwin"
+rembg>=2.0.50
+
+# NVIDIA telemetry (only on non-macOS systems with NVIDIA)
+nvidia-ml-py>=12.535.0; sys_platform != "darwin"

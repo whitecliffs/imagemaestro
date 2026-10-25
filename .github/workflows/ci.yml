@@ -1,0 +1,141 @@
+name: CI
+
+# Fast, dependency-light checks that must pass on every push + PR.
+# The clean-repo guard is the important one for a public repo: it fails
+# the build if mature/explicit prose or locally-generated model guides
+# ever leak into tracked source (see scripts/verify_clean_repo.py).
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+  workflow_dispatch:
+
+jobs:
+  guard:
+    name: Clean-repo guard + Python checks
+    runs-on: ubuntu-latest
+    env:
+      PYTHONPATH: app
+      CUDA_VISIBLE_DEVICES: "-1"
+      XFORMERS_FORCE_DISABLE_TRITON: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Clean-repo boundary guard
+        run: python scripts/verify_clean_repo.py
+      - name: Python syntax check (our modules)
+        # compileall only compiles (never imports), so it needs no deps.
+        run: >-
+          python -m compileall -q app/mmgp app/services app/launch.py
+          app/models/minimax_h3 app/models/qwen21 app/models/flux3 app/models/moss_image app/models/TTS/fish_audio app/models/longcat app/shared/kernels app/shared/tinyvae
+          app/shared/preview_runtime.py app/shared/qtypes app/shared/sol_attn
+          app/shared/attention.py app/shared/attention_kit.py app/shared/cuda_memory.py
+          app/shared/sage2_core.py app/shared/utils/default_device.py
+          app/shared/llm_engines/nanovllm/layerwise.py app/scripts/install_wgp_kernels.py
+          app/shared/utils/conv_bands.py app/shared/utils/power_throttling.py scripts
+      - name: Undefined Python names (our modules)
+        # Syntax compilation cannot detect a missing import or a value read
+        # before assignment on an infrequently exercised request path.
+        run: |
+          python -m pip install "ruff==0.16.2"
+          python -m ruff check --select F821,F823 app/services app/models/minimax_h3 app/models/qwen21 app/models/flux3 app/models/moss_image app/models/TTS/fish_audio app/launch.py app/shared/qtypes/int8_convrot.py app/shared/kernels app/shared/llm_engines/nanovllm/layerwise.py app/mmgp/experts.py app/mmgp/expert_compute.py app/scripts/install_wgp_kernels.py
+      - name: Install lightweight test dependencies
+        run: >-
+          python -m pip install
+          "starlette==0.46.1"
+          "fastapi==0.141.1"
+          "gradio==5.29.0"
+          "pydantic==2.10.6"
+          "python-multipart==0.0.32"
+          "httpx==0.28.1"
+          "soundfile==0.13.1"
+          "numpy==2.2.6"
+          "opencv-python-headless==4.12.0.88"
+          "Pillow==11.3.0"
+          "requests==2.32.4"
+          "cryptography==49.0.0"
+          "ffmpeg-python==0.2.0"
+          "imageio==2.37.2"
+          "av==16.1.0"
+          "decord==0.6.0"
+          "iopath==0.1.10"
+          "onnxruntime==1.22.0"
+          "pycocotools==2.0.11"
+          "rembg==2.0.65"
+          "scipy==1.15.3"
+          "librosa==0.11.0"
+          "timm==1.0.24"
+          "ftfy==6.3.1"
+          "pytest==8.4.2"
+      - name: Install CPU PyTorch test dependency
+        run: >-
+          python -m pip install
+          "torch==2.7.1"
+          "torchvision==0.22.1"
+          "torchaudio==2.7.1"
+          --index-url https://download.pytorch.org/whl/cpu
+      - name: Install pinned core model test dependencies
+        run: >-
+          python -m pip install
+          "diffusers==0.36.0"
+          "transformers==4.57.1"
+          "tokenizers==0.22.1"
+          "accelerate==1.12.0"
+          "einops==0.8.2"
+          "optimum-quanto==0.2.7"
+          "safetensors==0.8.0"
+          "psutil==7.2.2"
+          "gguf==0.17.1"
+          "triton==3.3.1"
+      - name: Python unit tests
+        # Native-library failures need an active test name and Python stack,
+        # rather than an anonymous exit 139 after buffered progress dots.
+        run: python -u -X faulthandler -m unittest discover -v -s tests -p "test_*.py"
+      - name: JSON grammar regression tests
+        # These are standalone test functions, so unittest discovery does not
+        # execute them yet. Keep this explicit runner until they are migrated.
+        run: python tests/test_call_llm_json_grammar.py
+      - name: Standalone preview, source-camera and media regressions
+        # Plain unittest discovery omits pytest functions/fixtures in these
+        # modules. CUDA-only checks retain their own skips.
+        run: >-
+          python -m pytest -q
+          tests/test_generation_preview.py
+          tests/test_generation_preview_support.py
+          tests/test_generation_preview_wiring.py
+          tests/test_h3_scheduler_clean_preview.py
+          tests/test_h3_source_camera.py
+          tests/test_media_flow.py
+          tests/test_tinyvae.py
+          tests/test_conv_bands.py
+
+  ui-build:
+    name: UI type-check + build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - name: Install UI deps
+        working-directory: ui
+        run: npm ci
+      - name: Frontend lint
+        working-directory: ui
+        run: npm run lint
+      - name: Startup request and recovery regressions
+        run: |
+          node tests/ui/read_requests.cjs
+          node tests/ui/startup_controller.cjs
+      - name: H3 checkpoint import UI regressions
+        run: |
+          node tests/ui/h3_checkpoint_import.cjs
+          node tests/ui/h3_checkpoint_download_ui.cjs
+      - name: Type-check + build (tsc -b && vite build)
+        working-directory: ui
+        run: npm run build

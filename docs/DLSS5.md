@@ -1,0 +1,243 @@
+# Optional DLSS finishing in Maestro
+
+Maestro adapts Wan2GP v12.71's native DLSS worker interfaces for Studio
+postprocessing, Tools → Upscale, and the batch Media Flow panel.
+
+Neural Rendering supports native-resolution x1 refinement and x1.5, x1.724,
+x2 and x3 enlargement, intensity from 0 to 2, depth precision and motion
+estimation controls. Estimated depth and motion come from the recorded media;
+lighting, material changes, fine detail and temporal stability are content-dependent.
+
+DLSS Frame Generation supports x2–x4 on supported RTX 40/50 hardware and
+x5/x6 where supported on RTX 50. Maestro exposes only factors reported by
+the installed worker. RIFE 4.26 x2/x3/x4 uses the Python GPU runtime and does
+not need these native binaries. Frame interpolation preserves clip duration
+and retains the original soundtrack in the finished file.
+
+## Requirements
+
+- An up-to-date compatible NVIDIA driver and DirectX 12.
+- Windows 11 for the standard Neural Rendering backend. Frame Generation
+  supports Windows 10 build 19041 or newer, including Windows 11, when the
+  installed native worker passes its capability probe.
+- RTX 30 or newer for this Neural Rendering integration; RTX 40 or newer for
+  Frame Generation. HAGS must be enabled for Frame Generation.
+- Native components installed in `app/dlss5/`, separate from Python packages.
+  Triton alone does not supply DLSS. First use downloads missing depth/flow
+  model weights through Maestro's existing model paths.
+
+An opt-in **experimental Windows 10** Neural Rendering backend is also available,
+described below. Frame Generation uses a separate installer and runtime; the
+experimental enhancement installer does not include it.
+
+## Experimental Windows 10 enhancement and upscaling
+
+This backend targets Windows 10 22H2 (build 19045), an RTX 30 or newer GPU,
+and a compatible NVIDIA driver. It uses the pinned ComfyUI-DLSS5-NR v0.3.1
+native bridge in a separate process; ComfyUI itself is not required.
+The local compatibility machine is an RTX 4090 running driver 591.86.
+
+- **DLSS 5 1x:** neural enhancement at the source resolution.
+- **DLSS 5 1.5x, 1.724x, 2x and 3x:** actual DLSS Super Resolution in a separate, unhooked worker,
+  followed by neural enhancement at the enlarged resolution. It does not
+  substitute Lanczos resizing for DLSS.
+- Video enhancement uses driver-provided NVIDIA optical flow (NVOFA), with
+  history reset at scene cuts. An unavailable temporal backend fails clearly.
+- Depth and DIS/RAFT options apply to the upscaling stage. Same-size direct
+  enhancement does not download or load depth/RAFT models.
+- For frame interpolation, install the separate Frame Generation components
+  below, or use RIFE. The experimental NR bridge itself does not add frames.
+
+Output dimensions are rounded to even pixels. The pinned Windows 10 SR worker
+needs aligned output rows on the tested runtime. Maestro extends the source's
+right edge and its guides internally when needed, then removes only that added
+border before neural enhancement. The original picture is not resized to meet
+this constraint. If internal padding would exceed the native 7680x4320 size
+limit, Maestro rejects the request with a size error.
+
+From the project folder, explicitly install using Maestro's Python environment:
+
+```powershell
+.\app\env\Scripts\python.exe .\app\scripts\install_dlss5_direct.py
+```
+
+Use `app\env-sol\Scripts\python.exe` for the RTX 40 Sol runtime, or
+`app\env-rtx50\Scripts\python.exe` for the RTX 50 runtime, when that is your
+active environment. Use the same interpreter for `--disable` below.
+Review the installer disclosure and type `I ACCEPT`, then restart
+Maestro. In **Tools → Upscale**, choose an image or video and select the
+**Win10 experimental** DLSS option. The same choices appear in Studio finishing
+and Media Flow. No app install/update silently enables this backend.
+
+To disable it without deleting files:
+
+```powershell
+.\app\env\Scripts\python.exe .\app\scripts\install_dlss5_direct.py --disable
+```
+
+Restart Maestro after changing installation/enablement. The pinned files live
+under `app/dlss5/direct/`, separate from the existing Windows 11 runtime. The
+installer verifies both archive and extracted-binary SHA-256 values and refuses
+to overwrite differing binaries. For offline installation, repeated `--cache-dir`
+arguments can point to folders holding the original verified ZIP archives.
+
+**Known native limitation:** this bridge can hang during shutdown even after
+returning valid pixels. Maestro contains it in a disposable worker with bounded
+shutdown and cancellation. Complete frame and finish receipts are required before
+forced cleanup can count as a successful render. A timeout during initialization
+or rendering remains an error. Maestro's main process never loads the bridge.
+This is community compatibility work, not official NVIDIA Windows 10 support.
+
+Local validation on Windows 10 22H2 / RTX 4090 / driver 591.86 passed through
+Maestro's normal queue: a 1216x704 still image, and a 36-frame, 24 fps video
+at both 608x352 (1x) and 1216x704 (2x). Both videos retained all frames, their
+1.5-second duration and byte-identical audio packets. Cancelling a second 2x
+run after two frames stopped both native workers and removed the partial output.
+Additional scale validation passed both still and four-frame native tests at
+1.5x, 1.724x and 3x. Normal queued upscales of the same 608x352 source produced
+912x528, 1048x606 and 1824x1056 videos respectively, retaining all 36 frames,
+24 fps, the 1.5-second duration and byte-identical audio packets. Regression
+tests cover edge padding, guide alignment, output cropping, native size limits,
+worker cleanup and the unchanged 1x/2x paths.
+These short compatibility tests do not establish long-video quality or support
+on every GPU/driver; start with a short clip when testing another system.
+
+Offline video finishing is not a real-time game integration. Games supply GPU
+color, depth and motion buffers directly; Maestro decodes recorded frames,
+estimates guides and transfers frames through separate SR/NR workers before
+encoding. A performance correction removed redundant per-pixel Python scans
+and full-frame copies while retaining vectorized output validation. In a
+four-frame 1280x704 → 2560x1408 test with RAFT/half-depth, frame processing fell
+from 15.58 to 2.77 seconds with identical output pixels. Warmed processing was
+about 0.49 seconds/frame on the above machine, excluding initialization,
+shutdown and final encoding. This remains below real-time video throughput.
+The OpenCV DIS motion and quarter-depth options can reduce guide work at a
+quality tradeoff; they do not remove frame-transfer or encoding costs.
+
+## Install on a supported Windows machine
+
+### Frame Generation only (Windows 10 or 11)
+
+To add DLSS temporal upsampling without installing or changing Neural Rendering,
+close Maestro and run this from its project folder:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\app\scripts\install_dlss5.ps1 -FrameGenerationOnly
+```
+
+This installs only the pinned WanGP Frame Generation worker, signed NVIDIA
+Frame Generation DLL, and their notices. It leaves the working Windows 10
+experimental upscaling files untouched. Review the disclosure, type `I ACCEPT`,
+then restart Maestro. RTX 40 or newer and HAGS are required; only multipliers
+reported by the native capability probe become selectable. The controls show
+the reason when Frame Generation is unavailable, including missing files,
+disabled HAGS, or a failed native probe. RIFE remains available independently.
+
+### Full Windows 11 bundle
+
+Close Maestro, then run in PowerShell from the Maestro project folder:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\app\scripts\install_dlss5.ps1
+```
+
+The installer displays the upstream third-party component disclosure and
+requires typing `I ACCEPT`. The Neural Rendering bundle uses RenoDX/ReShade
+and community-modified, unsigned NVIDIA-derived DLSSNR binaries outside
+the official SDK. Read that disclosure before accepting. No native files
+are installed automatically by normal Maestro installation or update.
+
+Downloads and extracted binaries are checked against pinned SHA-256 values.
+ReShade's installer is extracted, not executed. Differing existing files stop
+installation; the optional `-Force` flag backs them up before replacement.
+Do not use that flag without reviewing the conflict list. Restart Maestro,
+then use **Refresh availability** in the finishing controls.
+
+### Windows 11 compatibility and native checks
+
+Installed files and an RTX model name establish eligibility, not a successful
+Neural Rendering evaluation. Maestro checks a small 144x160 synthetic frame at
+1.5x through the standard processing adapter and installed native worker. Its
+requested 216x240 result exercises internal padding and cropping on both axes;
+an already aligned 128x128 DLAA probe could miss the reported size constraint.
+The bounded result is cached. **Refresh availability**
+invalidates that result and retries while Maestro is idle. A deferred busy check
+is not stored as a permanent hardware failure. A successful small probe does not
+certify every output size, scale or long video.
+
+API clients should request `GET /api/v1/media-flow/capabilities` while
+Maestro is idle before submitting Neural Rendering work. Add `?refresh=true`
+after installing or changing the runtime. Processing validation uses that
+cached result so it cannot start a native probe while a job owns the GPU.
+
+The pinned Windows 11 bundle is WanGP workers v1.1.3, RenoDX 4.70, DLSSNR
+310.8.SF-v2, DLSS SR 310.8.0 and ReShade 6.8.0. The
+[issue #190 retest](https://github.com/Blizaine/Maestro/issues/190#issuecomment-6325327912)
+on an RTX 5090, driver 617.42 and Windows 11 build 26300 found successful
+704x1280 processing at 1x, 2x and 3x, and 512x512 at 1.5x. The failing outputs
+included 1056x1920, 1214x2206 and 720x720. Across the nine reported cases, every
+success had both output dimensions divisible by 64 and every failure had an
+unaligned dimension. This supports an output-alignment workaround; it does not
+establish a universal hardware or driver rule.
+
+The standard Windows 11 adapter now edge-pads the source on the right and bottom
+when needed, using the same padding for RGBA frames, motion vectors and depth.
+It chooses a padded source size whose even-rounded native output is divisible
+by 64 on both axes, then crops only the added border from each output. Public
+frame dimensions retain the requested even-rounded scale. The image is not
+stretched to fill an aligned canvas. Already aligned cases keep their existing
+geometry, and the separate Windows 10 experimental path keeps its own policy.
+Both requested and padded geometry must fit the native 7680x4320 limit;
+otherwise processing fails before starting a worker.
+
+For example, 704x1280 at 1.5x requests 1056x1920. The adapter pads its source
+canvas to 768x1280, processes a 1152x1920 native result, and crops back to
+1056x1920. A 720x720 1x request uses a 768x768 internal canvas and returns
+720x720. These geometry, guide and crop paths are covered by CPU worker doubles;
+the padding build still needs native RTX 5090 confirmation. Other native errors
+can remain, and a successful small probe does not certify every scale or clip.
+
+The [worker releases](https://github.com/DeepBeepMeep/dlss5-visual-enhancer/releases)
+still list v1.1.3 as the current Windows worker release at review on 21 October
+2026. [Newer component uploads](https://github.com/RankFTW/rhi-repo/releases),
+including RenoDX prereleases and other DLSS runtimes, do not establish a tested
+replacement combination for this worker. The alignment workaround keeps the verified binary
+pins instead of replacing them with an unvalidated set. The Windows 10 results
+above apply to its separate experimental backend.
+
+If optional Studio finishing fails after generation, Maestro retains the saved
+original, marks generation completed and displays the finishing warning in its
+completion notice and completed queue entry. Output processing metadata also
+records the warning. Tools → Upscale and standalone Media Flow still fail when
+their requested processing fails. Cancelling processing remains cancellation.
+
+Runtime layout:
+
+```text
+app/dlss5/host/nr-depth-worker.exe
+app/dlss5/host/dxgi.dll
+app/dlss5/host/renodx-dlss5.addon64
+app/dlss5/host/nvngx_dlssnr.dll
+app/dlss5/dlss/nvngx_dlss.dll
+app/dlss5/dlssg/dlssg-worker.exe
+app/dlss5/dlssg/nvngx_dlssg.dll
+```
+
+## Use and troubleshoot
+
+Start with one short clip and x1 Neural Rendering at intensity 1. Compare
+faces and motion against the source before processing a collection.
+For motion smoothing, select RIFE x3 or an available DLSS factor in
+**Temporal upsampling**. In Media Flow, add files, choose finishing options,
+and queue the batch. Each file has its own progress, result and cancellation.
+Sources remain intact; the outputs receive a `_media_flow` suffix.
+
+Missing files, failed native capability probes, unsupported hardware, HAGS,
+worker errors and cancellation surface through the ordinary Maestro queue.
+Availability can also be inspected at `GET /api/v1/media-flow/capabilities`.
+The installer does not change your GPU driver, OS or HAGS setting.
+
+Sources: [Wan2GP DLSS5 overview and installation guide](https://github.com/deepbeepmeep/Wan2GP/blob/1e1dd2757f24923f008593d9d4ec09062234be20/docs/DLSS5.md),
+[NVIDIA Frame Generation requirements](https://github.com/NVIDIA-RTX/Streamline/blob/main/docs/ProgrammingGuideDLSS_G.md#10-requirements),
+[ComfyUI-DLSS5-NR v0.3.1](https://github.com/lisitskyaa/ComfyUI-DLSS5-NR/tree/41dcdfa593cb61b6a98c65bb8ed27606260bb598).
+Licenses and provenance: [Third-party notices](../THIRD_PARTY_NOTICES.md).
