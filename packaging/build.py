@@ -45,12 +45,15 @@ exit 0
 __IMAGEMAESTRO_PAYLOAD__
 '''.replace('DIGEST', digest)
     suffix = '.run' if platform.startswith('linux') else '.command'
-    artifact = out / ('ImageMaestro-3.2.5-' + platform + suffix)
-    artifact.write_bytes(header.encode() + payload)
-    artifact.chmod(0o755)
-    if platform.startswith('macos'):
-        with zipfile.ZipFile(str(artifact) + '.zip', 'w', zipfile.ZIP_STORED) as z:
-            z.write(artifact, artifact.name)
-    print(artifact)
+    for cloud_only in (False, True):
+        name = 'ImageMaestro-Cloud' if cloud_only else 'ImageMaestro'
+        artifact = out / (name + '-3.2.5-' + platform + suffix)
+        edition_header = header.replace('install.command" "$@"', 'install.command" --cloud-only "$@"') if cloud_only else header
+        artifact.write_bytes(edition_header.encode() + payload)
+        artifact.chmod(0o755)
+        if platform.startswith('macos'):
+            with zipfile.ZipFile(str(artifact) + '.zip', 'w', zipfile.ZIP_STORED) as z:
+                z.write(artifact, artifact.name)
+        print(artifact)
 artifacts = sorted(p for p in out.iterdir() if p.is_file() and p.name != 'SHA256SUMS')
 (out / 'SHA256SUMS').write_text(''.join(hashlib.sha256(p.read_bytes()).hexdigest() + '  ' + p.name + '\n' for p in artifacts))

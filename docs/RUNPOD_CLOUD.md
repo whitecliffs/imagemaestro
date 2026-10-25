@@ -38,6 +38,7 @@ cross-origin browser requests and mutations missing its custom header.
 
 ## Publish the image
 
+Public source repository: https://github.com/whitecliffs/imagemaestro .
 Use a public GitHub repository you control. The manually triggered
 `.github/workflows/runpod-image.yml` builds `cloud/Dockerfile` for Linux amd64.
 With `publish=true`, it pushes `ghcr.io/<owner>/<repository>:runpod-preview` using
@@ -67,7 +68,7 @@ currently free, while Actions usage is governed separately by GitHub's plan.
 
 ## Verification and remaining limits
 
-Focused automated tests use a fake provider and real local HTTP/ASGI checks; they
+21 focused automated tests use a fake provider and real local HTTP/ASGI checks; they
 never provision a paid resource. A real account/container/GPU test is still required
 for pricing/placement, proxy cookies, model loading, generation, download throughput
 and shutdown billing. Availability and displayed quotes may change before allocation;

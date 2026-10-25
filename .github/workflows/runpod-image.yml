@@ -35,3 +35,5 @@ jobs:
           push: ${{ inputs.publish }}
           tags: ${{ env.IMAGE }}
           labels: org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          cache-from: type=registry,ref=${{ env.IMAGE }}
+          cache-to: type=inline

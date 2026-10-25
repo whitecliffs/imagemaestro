@@ -59,7 +59,7 @@ class CloudAuthMiddleware:
                         break
                 try:
                     candidate = json.loads(body).get('token', '')
-                    valid = isinstance(candidate, str) and hmac.compare_digest(candidate, self.token)
+                    valid = isinstance(candidate, str) and hmac.compare_digest(candidate.encode(), self.token.encode())
                 except (ValueError, AttributeError):
                     valid = False
                 if not valid:
@@ -74,7 +74,7 @@ class CloudAuthMiddleware:
             pass
         cookie = cookies.get('__Host-imagemaestro')
         bearer = headers.get(b'authorization', b'').decode('latin1')
-        authenticated = hmac.compare_digest(bearer, 'Bearer ' + self.token) or (cookie is not None and hmac.compare_digest(cookie.value, self.cookie))
+        authenticated = hmac.compare_digest(bearer.encode(), ('Bearer ' + self.token).encode()) or (cookie is not None and hmac.compare_digest(cookie.value.encode(), self.cookie.encode()))
         if not authenticated:
             if scope['type'] == 'websocket':
                 return await send({'type': 'websocket.close', 'code': 1008})

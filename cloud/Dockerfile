@@ -4,6 +4,7 @@ WORKDIR /ui
 COPY ui/package.json ui/package-lock.json ./
 RUN npm ci
 COPY ui/ ./
+COPY app/shared/h3_performance_policy.json /app/shared/h3_performance_policy.json
 RUN npm run build
 
 FROM python:3.11-slim-bookworm

@@ -185,6 +185,8 @@ def check_and_build_ui():
 
 def main():
     if "--cloud-only" in sys.argv:
+        if not (UI_DIR / "dist/index.html").is_file():
+            raise RuntimeError("Build the cloud UI first: cd ui && npm ci && npm run build")
         subprocess.check_call([sys.executable, str(ROOT_DIR / "packaging/desktop.py"), str(ROOT_DIR), "--cloud-only"])
         print("Cloud launcher installed. Run python3 cloud_launcher.py or open ImageMaestro Cloud from your applications.")
         return

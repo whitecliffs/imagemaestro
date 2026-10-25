@@ -223,7 +223,7 @@ class CloudManager:
                 except CloudError as error:
                     if error.status != 404:
                         raise
-                    self.state.update(status='MISSING')
+                    self.state.update(status='MISSING', ready=False)
                 else:
                     self.state['status'] = pod.get('status', 'UNKNOWN')
                     if self.state['status'] in {'STOPPED', 'EXITED'}:
