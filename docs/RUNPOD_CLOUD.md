@@ -19,8 +19,9 @@
 online until the Pod is confirmed stopped. Cloud mode never provisions resources
 merely by opening the UI or connecting an account.
 
-For a packaged cloud-only installation, pass `--cloud-only` to the Linux `.run` or
-Mac `.command` installer. This installs a small private Python runtime and Cloud
+For a packaged cloud-only installation, use the `ImageMaestro-Cloud-...` Linux
+`.run` or Mac `.command` installer. It selects cloud-only mode automatically.
+You can also pass `--cloud-only` to the standard installer. This installs a small private Python runtime and Cloud
 application launcher without the local AI dependencies. A normal full installation
 adds both launchers. `python3 install.py --cloud-only` can also create the shortcut
 when a suitable Python is already available.

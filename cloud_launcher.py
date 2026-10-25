@@ -92,7 +92,21 @@ def main():
     parser.add_argument('--port', type=int, default=7870)
     parser.add_argument('--no-browser', action='store_true')
     args = parser.parse_args()
-    server = make_server(args.port)
+    try:
+        server = make_server(args.port)
+    except OSError:
+        import urllib.request
+        try:
+            url = f'http://127.0.0.1:{args.port}'
+            with urllib.request.urlopen(url + '/api/cloud/settings', timeout=2) as response:
+                if response.headers.get('X-ImageMaestro-Cloud') != '1':
+                    raise ValueError('Another application owns this port')
+            print('Cloud control is already running: ' + url + '/cloud')
+            if not args.no_browser:
+                webbrowser.open(url + '/cloud')
+            return
+        except Exception:
+            raise SystemExit('The cloud launcher port is occupied. Choose another --port.')
     # One control plane owns the persisted session, even across multiple local windows.
     import fcntl
     server.manager.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
