@@ -1,5 +1,5 @@
 {
   "signup_url": "https://runpod.io?ref=gnx5i108",
-  "image": "",
+  "image": "ghcr.io/whitecliffs/imagemaestro@sha256:935c205736518f90b0cf7695119185ea1d0e4e2e7b6f6417ec7cc90e25f367c2",
   "default_gpu": "NVIDIA RTX A6000"
 }

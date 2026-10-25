@@ -42,7 +42,7 @@ Runpod's referral programme.
 
 Use `--cloud-only` with the standalone installer to skip local AI dependencies.
 See [cloud setup, billing safeguards and publishing](docs/RUNPOD_CLOUD.md).
-A tested published container image must be configured before paid launch is enabled.
+The preview is pinned to a public container image that passed startup and authentication checks. Live Runpod GPU inference still needs validation.
 
 ## 🚀 Quick Start
 

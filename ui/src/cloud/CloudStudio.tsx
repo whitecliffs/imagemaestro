@@ -79,7 +79,7 @@ export default function CloudStudio() {
     return () => { cancelled = true; clearTimeout(timer) }
   }, [settings?.connected, session.pod_id])
 
-  return <main className="min-h-screen bg-bg-primary text-text-primary overflow-y-auto">
+  return <main className="h-full bg-bg-primary text-text-primary overflow-y-auto">
     <div className="mx-auto max-w-5xl px-5 py-8 md:py-12">
       <header className="mb-9 flex flex-wrap items-center justify-between gap-4">
         <div className="flex items-center gap-3"><div className="rounded-xl bg-orange-500/15 p-3 text-orange-400"><Cloud size={25} /></div><div><p className="text-xs uppercase tracking-widest text-text-muted">ImageMaestro</p><h1 className="text-2xl font-semibold">Cloud GPU studio</h1></div></div>

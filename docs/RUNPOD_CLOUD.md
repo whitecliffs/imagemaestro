@@ -70,7 +70,7 @@ currently free, while Actions usage is governed separately by GitHub's plan.
 ## Verification and remaining limits
 
 21 focused automated tests use a fake provider and real local HTTP/ASGI checks; they
-never provision a paid resource. A real account/container/GPU test is still required
+never provision a paid resource. The public image built successfully and passed a CPU container startup/authentication smoke test in GitHub Actions (https://github.com/whitecliffs/imagemaestro/actions/runs/40218611591). A real Runpod account/GPU test is still required
 for pricing/placement, proxy cookies, model loading, generation, download throughput
 and shutdown billing. Availability and displayed quotes may change before allocation;
 the displayed session estimate excludes separate storage/tax and is not an invoice.
@@ -87,3 +87,26 @@ Official API reference:
 - https://docs.runpod.io/api-reference-v2/catalog/list-gpu-types
 - https://docs.runpod.io/api-reference-v2/pods/trigger-a-pod-state-transition
 - https://docs.runpod.io/api-reference-v2/network-volumes/list-network-volumes
+
+## Inherited CI findings
+
+The broader upstream suite ran 4,902 tests in GitHub Actions and reported 30
+errors and six failed assertions. The errors reference legacy Pinokio JS files
+that were already moved from the root into `legacy_pinokio/` by the standalone
+conversion; the assertions concern the existing hardware-detection fake Torch
+objects, which lack the `backends` attribute now probed by that detector. The
+hardware detector is unchanged by this cloud task. These failures are not hidden
+or suppressed; the original CI remains red until those legacy contracts are
+updated separately. Cloud lifecycle tests, frontend lint/build, and container
+startup/authentication checks are reported independently.
+
+## Verified preview image
+
+`ghcr.io/whitecliffs/imagemaestro@sha256:935c205736518f90b0cf7695119185ea1d0e4e2e7b6f6417ec7cc90e25f367c2`
+
+This exact public image passed container startup, anonymous-access rejection,
+authenticated UI/API/classic access, and secure-cookie checks. Local cloud-only
+installation and browser start/download/stop/release flows were tested separately
+(the billable provider lifecycle used mocks). Desktop and mobile control-panel QA
+passed, including mouse-wheel scrolling at 390×844. Live Runpod GPU inference and
+macOS installer execution remain untested.
